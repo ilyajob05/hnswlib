@@ -35,6 +35,7 @@ set(TEST_NAMES
     resize_test
     searchKnnCloserFirst_test
     searchKnnWithFilter_test
+    turbo_quant_test
     )
 
 function(add_cxx_flags)
