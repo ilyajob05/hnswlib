@@ -21,6 +21,12 @@
 #include <numeric>
 #include <cmath>
 #include <chrono>
+#include <fstream>
+#include <cstdio>
+
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
 
 using namespace hnswlib::turboquant;
 
@@ -976,6 +982,237 @@ bool test_save_load_index() {
 }
 
 // ---------------------------------------------------------------------------
+// Large-scale comparison: L2Space vs TurboQuantSpace
+// 1M vectors, dim=1024.  Reports memory, file size, build time, search time,
+// recall@10.
+// ---------------------------------------------------------------------------
+
+/// Returns resident set size (RSS) in bytes. macOS only; returns 0 elsewhere.
+static size_t getCurrentRSS() {
+#ifdef __APPLE__
+    struct mach_task_basic_info info;
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                  (task_info_t)&info, &count) == KERN_SUCCESS) {
+        return info.resident_size;
+    }
+#endif
+    return 0;
+}
+
+static size_t fileSize(const std::string& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    return f.good() ? static_cast<size_t>(f.tellg()) : 0;
+}
+
+/// Generates a single random unit vector (no storage of the full dataset).
+static void generateRandomVector(float* out, size_t d, std::mt19937_64& rng) {
+    std::normal_distribution<float> gauss(0.0f, 1.0f);
+    for (size_t i = 0; i < d; ++i) out[i] = gauss(rng);
+    normalize(out, d);
+}
+
+void test_large_scale_comparison() {
+    std::cout << "=== Large-scale comparison: L2Space vs TurboQuantSpace ==="
+              << std::endl;
+
+    constexpr size_t D = 1024;
+    constexpr size_t N = 1000000;
+    constexpr size_t NUM_QUERIES = 100;
+    constexpr size_t K = 10;
+    constexpr size_t M = 16;
+    constexpr size_t EF_CONSTRUCTION = 100;
+    constexpr size_t EF_SEARCH = 64;
+
+    const std::string file_l2 = "bench_l2.bin";
+    const std::string file_tq = "bench_tq.bin";
+
+    // Pre-generate query vectors (small — 100 × 1024 floats = 400 KB)
+    std::mt19937_64 qrng(99999);
+    std::vector<std::vector<float>> queries(NUM_QUERIES,
+        std::vector<float>(D));
+    for (size_t q = 0; q < NUM_QUERIES; ++q) {
+        generateRandomVector(queries[q].data(), D, qrng);
+    }
+
+    // -----------------------------------------------------------------------
+    // Part A: Standard L2Space HNSW
+    // -----------------------------------------------------------------------
+    std::cout << "\n  --- L2Space (raw float32) ---" << std::endl;
+    {
+        hnswlib::L2Space l2space(D);
+        size_t rss_before = getCurrentRSS();
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+        hnswlib::HierarchicalNSW<float> hnsw(&l2space, N, M, EF_CONSTRUCTION);
+
+        std::mt19937_64 rng(42);
+        std::vector<float> vec(D);
+        for (size_t i = 0; i < N; ++i) {
+            generateRandomVector(vec.data(), D, rng);
+            hnsw.addPoint(vec.data(), i);
+            if ((i + 1) % 100000 == 0) {
+                std::cout << "    inserted " << (i + 1) / 1000 << "K..."
+                          << std::endl;
+            }
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double build_sec = std::chrono::duration<double>(t1 - t0).count();
+
+        size_t rss_after = getCurrentRSS();
+        size_t rss_delta = (rss_after > rss_before) ? (rss_after - rss_before) : 0;
+
+        // Save
+        hnsw.saveIndex(file_l2);
+        size_t fsize = fileSize(file_l2);
+
+        // Search
+        hnsw.setEf(EF_SEARCH);
+        t0 = std::chrono::high_resolution_clock::now();
+        for (size_t q = 0; q < NUM_QUERIES; ++q) {
+            auto result = hnsw.searchKnn(queries[q].data(), K);
+            (void)result;
+        }
+        t1 = std::chrono::high_resolution_clock::now();
+        double search_sec = std::chrono::duration<double>(t1 - t0).count();
+
+        std::cout << std::fixed << std::setprecision(2);
+        std::cout << "    Build time:    " << build_sec << " s" << std::endl;
+        std::cout << "    RSS delta:     " << (rss_delta / (1024.0 * 1024.0))
+                  << " MB" << std::endl;
+        std::cout << "    data_size/vec: " << l2space.get_data_size()
+                  << " B" << std::endl;
+        std::cout << "    Index file:    " << (fsize / (1024.0 * 1024.0))
+                  << " MB" << std::endl;
+        std::cout << "    Search time:   " << (search_sec / NUM_QUERIES * 1000.0)
+                  << " ms/query (" << NUM_QUERIES << " queries, ef="
+                  << EF_SEARCH << ")" << std::endl;
+
+        // Cleanup — release memory before TurboQuant build
+        std::remove(file_l2.c_str());
+    }
+
+    // -----------------------------------------------------------------------
+    // Part B: TurboQuantSpace HNSW
+    // -----------------------------------------------------------------------
+    std::cout << "\n  --- TurboQuantSpace (3-bit SQ + 1-bit QJL) ---"
+              << std::endl;
+    {
+        uint64_t rot_seed = 42;
+        uint64_t qjl_seed = 137;
+        TurboQuantSpace tqspace(D, 4, rot_seed, qjl_seed);
+        size_t rss_before = getCurrentRSS();
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+        hnswlib::HierarchicalNSW<float> hnsw(&tqspace, N, M, EF_CONSTRUCTION);
+
+        std::mt19937_64 rng(42);  // same seed → same data
+        std::vector<float> vec(D);
+        std::vector<char> buf(tqspace.codeSizeBytes());
+        for (size_t i = 0; i < N; ++i) {
+            generateRandomVector(vec.data(), D, rng);
+            tqspace.encodeVector(vec.data(), buf.data());
+            hnsw.addPoint(buf.data(), i);
+            if ((i + 1) % 100000 == 0) {
+                std::cout << "    inserted " << (i + 1) / 1000 << "K..."
+                          << std::endl;
+            }
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double build_sec = std::chrono::duration<double>(t1 - t0).count();
+
+        size_t rss_after = getCurrentRSS();
+        size_t rss_delta = (rss_after > rss_before) ? (rss_after - rss_before) : 0;
+
+        // Save
+        hnsw.saveIndex(file_tq);
+        size_t fsize = fileSize(file_tq);
+
+        // Search
+        hnsw.setEf(EF_SEARCH);
+        t0 = std::chrono::high_resolution_clock::now();
+        for (size_t q = 0; q < NUM_QUERIES; ++q) {
+            auto pq = tqspace.prepareQuery(queries[q].data());
+            tqspace.beginSearch(pq);
+            auto result = hnsw.searchKnn(queries[q].data(), K);
+            tqspace.endSearch();
+            (void)result;
+        }
+        t1 = std::chrono::high_resolution_clock::now();
+        double search_sec = std::chrono::duration<double>(t1 - t0).count();
+
+        std::cout << std::fixed << std::setprecision(2);
+        std::cout << "    Build time:    " << build_sec << " s" << std::endl;
+        std::cout << "    RSS delta:     " << (rss_delta / (1024.0 * 1024.0))
+                  << " MB" << std::endl;
+        std::cout << "    data_size/vec: " << tqspace.get_data_size()
+                  << " B" << std::endl;
+        std::cout << "    Index file:    " << (fsize / (1024.0 * 1024.0))
+                  << " MB" << std::endl;
+        std::cout << "    Search time:   " << (search_sec / NUM_QUERIES * 1000.0)
+                  << " ms/query (" << NUM_QUERIES << " queries, ef="
+                  << EF_SEARCH << ")" << std::endl;
+
+        // Recall: brute-force exact L2 over 1M for each query
+        // Regenerate data with the same seed
+        std::cout << "    Computing recall (brute-force)..." << std::endl;
+        std::mt19937_64 rng2(42);
+        // Store all vectors for brute-force — but 1M×1024 = 4GB is too much.
+        // Instead, compute exact distances on-the-fly per query.
+        size_t total_hits = 0;
+        for (size_t q = 0; q < NUM_QUERIES; ++q) {
+            const float* query = queries[q].data();
+
+            // HNSW result
+            auto pq = tqspace.prepareQuery(query);
+            tqspace.beginSearch(pq);
+            auto result = hnsw.searchKnn(query, K);
+            tqspace.endSearch();
+            std::vector<size_t> hnsw_ids;
+            while (!result.empty()) {
+                hnsw_ids.push_back(result.top().second);
+                result.pop();
+            }
+
+            // Exact top-K: scan all vectors, keep a partial top-K heap
+            std::vector<std::pair<float, size_t>> topk;
+            topk.reserve(K + 1);
+            std::mt19937_64 rng_scan(42);
+            std::vector<float> scan_vec(D);
+            for (size_t i = 0; i < N; ++i) {
+                generateRandomVector(scan_vec.data(), D, rng_scan);
+                float dist = l2_dist(query, scan_vec.data(), D);
+                if (topk.size() < K) {
+                    topk.push_back({dist, i});
+                    if (topk.size() == K) {
+                        std::make_heap(topk.begin(), topk.end());
+                    }
+                } else if (dist < topk.front().first) {
+                    std::pop_heap(topk.begin(), topk.end());
+                    topk.back() = {dist, i};
+                    std::push_heap(topk.begin(), topk.end());
+                }
+            }
+
+            for (size_t ti = 0; ti < topk.size(); ++ti) {
+                for (size_t j = 0; j < hnsw_ids.size(); ++j) {
+                    if (hnsw_ids[j] == topk[ti].second) {
+                        ++total_hits;
+                        break;
+                    }
+                }
+            }
+        }
+        float recall = static_cast<float>(total_hits)
+                     / static_cast<float>(NUM_QUERIES * K);
+        std::cout << "    Recall@" << K << ":     " << std::setprecision(2)
+                  << (recall * 100.0f) << "%" << std::endl;
+
+        std::remove(file_tq.c_str());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Performance benchmark (informational, no pass/fail)
 // ---------------------------------------------------------------------------
 void test_benchmark() {
@@ -1117,6 +1354,8 @@ int main() {
     test_memory_footprint();
     std::cout << std::endl;
     test_benchmark();
+    std::cout << std::endl;
+    test_large_scale_comparison();
     std::cout << std::endl;
 
     std::cout << "============================================" << std::endl;
