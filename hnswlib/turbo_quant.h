@@ -324,6 +324,49 @@ public:
     float gamma_;   ///< ‖residual‖₂ in rotated space
     float norm_;    ///< ‖x‖₂ of the original vector
     float sigma_;   ///< Std dev of rotated coordinates (Lloyd-Max rescaling)
+
+    // -- Size helpers --------------------------------------------------------
+
+    /// Serialized code size in bytes for a given dimension.
+    static size_t codeSizeBytes(size_t dim) {
+        return dim + ((dim + 63) / 64) * sizeof(uint64_t) + sizeof(float) * 3;
+    }
+
+    // -- Serialization -------------------------------------------------------
+
+    /// Serialize to a flat byte buffer.
+    /// Caller must provide buf of at least codeSizeBytes(dim) bytes.
+    /// Layout: [sq_packed (dim)] [qjl_signs (ceil(dim/64)*8)] [norm] [gamma] [sigma]
+    void serializeTo(char* buf, size_t dim) const {
+        std::memcpy(buf, sq_packed_.data(), dim);
+        buf += dim;
+        size_t qjl_bytes = ((dim + 63) / 64) * sizeof(uint64_t);
+        std::memcpy(buf, qjl_signs_.data(), qjl_bytes);
+        buf += qjl_bytes;
+        std::memcpy(buf, &norm_, sizeof(float));
+        std::memcpy(buf + sizeof(float), &gamma_, sizeof(float));
+        std::memcpy(buf + 2 * sizeof(float), &sigma_, sizeof(float));
+    }
+
+    /// Deserialize from a flat byte buffer.
+    /// boundaries/centroids must point to the same static tables used for encoding.
+    static TurboQuantCode deserializeFrom(const char* buf, size_t dim,
+                                          const float* boundaries,
+                                          int num_boundaries,
+                                          const float* centroids) {
+        TurboQuantCode code(boundaries, num_boundaries, centroids);
+        code.sq_packed_.resize(dim);
+        std::memcpy(code.sq_packed_.data(), buf, dim);
+        buf += dim;
+        size_t num_words = (dim + 63) / 64;
+        code.qjl_signs_.resize(num_words);
+        std::memcpy(code.qjl_signs_.data(), buf, num_words * sizeof(uint64_t));
+        buf += num_words * sizeof(uint64_t);
+        std::memcpy(&code.norm_, buf, sizeof(float));
+        std::memcpy(&code.gamma_, buf + sizeof(float), sizeof(float));
+        std::memcpy(&code.sigma_, buf + 2 * sizeof(float), sizeof(float));
+        return code;
+    }
 };
 
 // ===========================================================================
@@ -557,6 +600,20 @@ class TurboQuantEncoder {
         return static_cast<float>(codeSizeBytes() * 8)
              / static_cast<float>(dim_);
     }
+};
+
+// ===========================================================================
+// Section 8: TurboQuantPreparedQuery — pre-computed query state for search
+//
+// Created once per query, reused across all candidate comparisons.
+// Eliminates 2 RHT calls + 3 heap allocations per distance computation.
+// ===========================================================================
+
+struct TurboQuantPreparedQuery {
+    std::vector<float> q_rot;   ///< normalized + RHT-rotated query (dim floats)
+    std::vector<float> s_q;     ///< RHT(q_rot, qjl_signs) for QJL correction
+    float q_norm_sq;            ///< ||query||^2
+    float q_norm;               ///< ||query||
 };
 
 }  // namespace turboquant
