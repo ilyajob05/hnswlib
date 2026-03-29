@@ -82,6 +82,7 @@ bool test_wht_energy() {
     std::mt19937_64 rng(42);
     std::normal_distribution<float> gauss(0.0f, 1.0f);
 
+    auto signs42 = generateSigns(D, 42);
     float max_err = 0.0f;
     for (int trial = 0; trial < 100; ++trial) {
         std::vector<float> v(D);
@@ -89,7 +90,7 @@ bool test_wht_energy() {
         float energy_before = dot(v.data(), v.data(), D);
 
         std::vector<float> rotated(v);
-        randomizedHadamard(rotated.data(), D, 42);
+        randomizedHadamard(rotated.data(), signs42.data(), D);
         float energy_after = dot(rotated.data(), rotated.data(), D);
 
         float rel_err = std::abs(energy_after - energy_before) / energy_before;
@@ -128,13 +129,13 @@ bool test_sq_distortion() {
         std::vector<float> rotated(embeddings[i]);
         float inv_norm = 1.0f / code.norm_;
         for (size_t j = 0; j < D; ++j) rotated[j] *= inv_norm;
-        randomizedHadamard(rotated.data(), D, enc.rotationSeed());
+        randomizedHadamard(rotated.data(), enc.rotationSigns(), D);
 
+        std::vector<float> recon(D);
+        code.dequantizeBatch(recon.data(), D);
         float mse = 0.0f;
         for (size_t j = 0; j < D; ++j) {
-            float recon = sqDequantize(code.sq_packed_[j], enc.centroids())
-                          * code.sigma_;
-            float diff = rotated[j] - recon;
+            float diff = rotated[j] - recon[j];
             mse += diff * diff;
         }
         mse /= static_cast<float>(D);
@@ -220,11 +221,12 @@ bool test_unbiasedness() {
 bool test_lossless_identity() {
     std::cout << "=== Test 3b: MSE + residual = exact (lossless identity) ===" << std::endl;
 
-    constexpr size_t D = 128;
-    constexpr size_t N = 200;
+    constexpr size_t D = 512;
+    constexpr size_t N = 200000;
 
     auto embeddings = generateFaceEmbeddings(N, D);
     uint64_t rot_seed = 42;
+    auto rot_signs = generateSigns(D, rot_seed);
 
     double max_err = 0.0;
     for (size_t i = 0; i < N; ++i) {
@@ -245,21 +247,21 @@ bool test_lossless_identity() {
             std::vector<float> y_rot(D);
             float y_inv = 1.0f / y_norm;
             for (size_t k = 0; k < D; ++k) y_rot[k] = y[k] * y_inv;
-            randomizedHadamard(y_rot.data(), D, rot_seed);
+            randomizedHadamard(y_rot.data(), rot_signs.data(), D);
 
             // Rotate x
             std::vector<float> x_rot(D);
             float x_inv = 1.0f / x_norm;
             for (size_t k = 0; k < D; ++k) x_rot[k] = x[k] * x_inv;
-            randomizedHadamard(x_rot.data(), D, rot_seed);
+            randomizedHadamard(x_rot.data(), rot_signs.data(), D);
 
+            std::vector<float> cv(D);
+            code.dequantizeBatch(cv.data(), D);
             float ip_mse = 0.0f;
             float ip_res = 0.0f;
             for (size_t k = 0; k < D; ++k) {
-                float cv = sqDequantize(code.sq_packed_[k], enc.centroids())
-                           * code.sigma_;
-                ip_mse += y_rot[k] * cv;
-                ip_res += y_rot[k] * (x_rot[k] - cv);
+                ip_mse += y_rot[k] * cv[k];
+                ip_res += y_rot[k] * (x_rot[k] - cv[k]);
             }
             float reconstructed = (ip_mse + ip_res) * x_norm * y_norm;
             double err = std::abs(reconstructed - exact_ip);

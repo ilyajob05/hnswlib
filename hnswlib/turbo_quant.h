@@ -101,23 +101,41 @@ inline void whtInplace(float* data, size_t d) {
 
 // ===========================================================================
 // Section 3: Randomized Hadamard Transform (RHT)
-// Applies random diagonal sign matrix D (determined by seed) then WHT.
+// Applies random diagonal sign matrix D then WHT.
 // Orthogonal transform preserving inner products and norms.
 // Used as both PolarQuant rotation and QJL projection matrix S.
-//
-// Input:  data — float[d], seed — deterministic RNG seed
-// Output: data — RHT-transformed in-place
 // ===========================================================================
 
-inline void randomizedHadamard(float* data, size_t d, uint64_t seed) {
+/// Precompute random sign vector (+1.0f / -1.0f) from a seed.
+/// Uses 1 RNG call per 64 elements (packs 64 sign bits per uint64_t).
+inline std::vector<float> generateSigns(size_t d, uint64_t seed) {
+    std::vector<float> signs(d);
+    SplitMix64 rng(seed);
+    size_t i = 0;
+    for (; i + 64 <= d; i += 64) {
+        uint64_t bits = rng.next();
+        for (size_t j = 0; j < 64; ++j) {
+            signs[i + j] = (bits & (1ULL << j)) ? 1.0f : -1.0f;
+        }
+    }
+    if (i < d) {
+        uint64_t bits = rng.next();
+        for (size_t j = 0; i + j < d; ++j) {
+            signs[i + j] = (bits & (1ULL << j)) ? 1.0f : -1.0f;
+        }
+    }
+    return signs;
+}
+
+/// RHT with precomputed sign vector. Elementwise multiply + WHT.
+inline void randomizedHadamard(float* data, const float* __restrict__ signs,
+                               size_t d) {
     assert(d > 0 && (d & (d - 1)) == 0
            && "randomizedHadamard: d must be a positive power of 2");
 
-    SplitMix64 rng(seed);
     for (size_t i = 0; i < d; ++i) {
-        data[i] *= rng.randomSign();
+        data[i] *= signs[i];
     }
-
     whtInplace(data, d);
 }
 
@@ -130,72 +148,170 @@ inline void randomizedHadamard(float* data, size_t d, uint64_t seed) {
 
 namespace detail {
 
-// 3-bit Lloyd-Max (8 levels) — MSE stage when total budget b=4
-constexpr float LM3_BOUNDARIES[7] = {
-    -1.748f, -1.050f, -0.5006f,
-     0.0f,
-     0.5006f,  1.050f,  1.748f
+// Hardcoded reference values (Max, 1960):
+// LM3_CENTROIDS ≈ {-2.1519, -1.3440, -0.7560, -0.2451, 0.2451, 0.7560, 1.3440, 2.1519}
+// LM4_CENTROIDS ≈ {-3.0867, -2.0995, -1.6180, -1.2562, -0.9423, -0.6568, -0.3881, -0.1284, ...}
+
+struct LloydMaxTable {
+    std::vector<float> boundaries;
+    std::vector<float> centroids;
 };
 
-constexpr float LM3_CENTROIDS[8] = {
-    -2.1519f, -1.3440f, -0.7560f, -0.2451f,
-     0.2451f,  0.7560f,  1.3440f,  2.1519f
-};
+inline LloydMaxTable computeLloydMax(int bits, int maxIter = 100,
+                                     double tol = 1e-12) {
+    const int levels = 1 << bits;
+    const int half = levels / 2;
 
-// 4-bit Lloyd-Max (16 levels) — MSE stage when total budget b=5
-constexpr float LM4_BOUNDARIES[15] = {
-    -2.401f, -1.844f, -1.437f, -1.099f,
-    -0.7961f, -0.5097f, -0.2318f,
-     0.0f,
-     0.2318f,  0.5097f,  0.7961f,
-     1.099f,   1.437f,   1.844f,   2.401f
-};
+    // φ(x) — standard normal PDF
+    auto phi = [](double x) -> double {
+        return std::exp(-0.5 * x * x) / std::sqrt(2.0 * M_PI);
+    };
+    // Φ(x) — standard normal CDF
+    auto Phi = [](double x) -> double {
+        return 0.5 * std::erfc(-x * M_SQRT1_2);
+    };
+    // E[x | a < x < b] for N(0,1)
+    auto conditionalMean = [&](double a, double b) -> double {
+        double denom = Phi(b) - Phi(a);
+        if (denom < 1e-15) return 0.5 * (a + b);
+        return (phi(a) - phi(b)) / denom;
+    };
 
-constexpr float LM4_CENTROIDS[16] = {
-    -3.0867f, -2.0995f, -1.6180f, -1.2562f,
-    -0.9423f, -0.6568f, -0.3881f, -0.1284f,
-     0.1284f,  0.3881f,  0.6568f,  0.9423f,
-     1.2562f,  1.6180f,  2.0995f,  3.0867f
-};
+    // Initialize: positive centroids uniformly in (0, 3.5)
+    std::vector<double> pos_c(half);
+    for (int i = 0; i < half; ++i) {
+        pos_c[i] = (i + 0.5) * 3.5 / half;
+    }
+
+    for (int iter = 0; iter < maxIter; ++iter) {
+        // Boundaries between positive centroids
+        std::vector<double> pos_b(half - 1);
+        for (int i = 0; i < half - 1; ++i) {
+            pos_b[i] = 0.5 * (pos_c[i] + pos_c[i + 1]);
+        }
+
+        // Update centroids: E[x | boundary_k < x < boundary_{k+1}]
+        std::vector<double> new_c(half);
+        double maxDelta = 0.0;
+        for (int i = 0; i < half; ++i) {
+            double lo = (i == 0) ? 0.0 : pos_b[i - 1];
+            double hi = (i == half - 1) ? 1e10 : pos_b[i];
+            new_c[i] = conditionalMean(lo, hi);
+            maxDelta = std::max(maxDelta, std::abs(new_c[i] - pos_c[i]));
+        }
+        pos_c = new_c;
+        if (maxDelta < tol) break;
+    }
+
+    // Build full symmetric tables
+    LloydMaxTable table;
+    table.centroids.resize(levels);
+    table.boundaries.resize(levels - 1);
+
+    for (int i = 0; i < half; ++i) {
+        table.centroids[half + i]      =  static_cast<float>(pos_c[i]);
+        table.centroids[half - 1 - i]  = -static_cast<float>(pos_c[i]);
+    }
+    // Boundary 0 is always 0.0 (symmetry axis)
+    table.boundaries[half - 1] = 0.0f;
+    for (int i = 0; i < half - 1; ++i) {
+        double b = 0.5 * (pos_c[i] + pos_c[i + 1]);
+        table.boundaries[half + i]      =  static_cast<float>(b);
+        table.boundaries[half - 2 - i]  = -static_cast<float>(b);
+    }
+
+    return table;
+}
+
+// Computed once at startup with full double precision
+static const LloydMaxTable LM3 = computeLloydMax(3);
+static const LloydMaxTable LM4 = computeLloydMax(4);
 
 }  // namespace detail
 
 // ===========================================================================
-// Section 5: Scalar Quantization
-// ===========================================================================
-
-/// Maps a scalar value to a Lloyd-Max bin index via linear scan.
-/// Input:  val — normalized value (zero-mean, unit-variance expected)
-///         boundaries — sorted decision thresholds, length num_boundaries
-/// Output: bin index in [0, num_boundaries]
-inline uint8_t sqQuantize(float val, const float* boundaries,
-                          int num_boundaries) {
-    assert(num_boundaries > 0 && "sqQuantize: empty boundary table");
-
-    uint8_t idx = 0;
-    for (int i = 0; i < num_boundaries; ++i) {
-        if (val > boundaries[i]) {
-            idx = static_cast<uint8_t>(i + 1);
-        }
-    }
-    return idx;
-}
-
-/// Maps a bin index back to the corresponding Lloyd-Max centroid value.
-/// Caller must ensure idx < num_centroids (2^mse_bits).
-inline float sqDequantize(uint8_t idx, const float* centroids) {
-    return centroids[idx];
-}
-
-// ===========================================================================
-// Section 6: TurboQuantCode — encoded representation of a single vector
+// Section 5: TurboQuantCode — encoded representation of a single vector
 //
 // Algorithm 2 output. Stores the compressed representation produced by
 // encode(), consumed by asymmetricInnerProduct() and asymmetricL2().
+//
+// Also owns quantization parameters (boundaries/centroids) so that
+// quantize/dequantize can be called as methods.  The parameters are set
+// once (by TurboQuantEncoder or when reading from file) and never change.
 // ===========================================================================
 
 class TurboQuantCode {
+    const float* boundaries_;
+    int num_boundaries_;
+    const float* centroids_;
+
 public:
+    TurboQuantCode()
+        : boundaries_(nullptr), num_boundaries_(0), centroids_(nullptr)
+        , gamma_(0), norm_(0), sigma_(0) {}
+
+    TurboQuantCode(const float* boundaries, int num_boundaries,
+                   const float* centroids)
+        : boundaries_(boundaries), num_boundaries_(num_boundaries)
+        , centroids_(centroids)
+        , gamma_(0), norm_(0), sigma_(0) {}
+
+    // -- Quantization parameters (read-only after construction) ---------------
+
+    const float* boundaries() const { return boundaries_; }
+    int numBoundaries() const { return num_boundaries_; }
+    const float* centroids() const { return centroids_; }
+
+    // -- Scalar quantization methods -----------------------------------------
+
+    /// Maps a scalar value to a Lloyd-Max bin index via linear scan.
+    /// Input:  val — normalized value (zero-mean, unit-variance expected)
+    /// Output: bin index in [0, num_boundaries]
+    uint8_t quantize(const float val) const {
+        assert(num_boundaries_ > 0 && "quantize: empty boundary table");
+        uint8_t idx = 0;
+        for (int i = 0; i < num_boundaries_; ++i) {
+            if (val > boundaries_[i]) {
+                idx = static_cast<uint8_t>(i + 1);
+            }
+        }
+        return idx;
+    }
+
+    /// Batch quantization: quantize count values into sq_packed_.
+    void quantizeBatch(const float* __restrict__ vals, const size_t count) {
+        assert(num_boundaries_ > 0 && "quantizeBatch: empty boundary table");
+        sq_packed_.resize(count);
+        for (size_t k = 0; k < count; ++k) {
+            uint8_t idx = 0;
+            for (int i = 0; i < num_boundaries_; ++i) {
+                idx += (vals[k] > boundaries_[i]);
+            }
+            sq_packed_[k] = idx;
+        }
+    }
+
+    /// Maps a bin index back to the corresponding Lloyd-Max centroid value.
+    /// Caller must ensure idx < num_centroids (2^mse_bits).
+    float dequantize(const uint8_t idx) const {
+        return centroids_[idx];
+    }
+
+    /// Dequantize the i-th coordinate from sq_packed_.
+    float dequantize(size_t i) const {
+        return centroids_[sq_packed_[i]];
+    }
+
+    /// Batch dequantization: reconstruct all sq_packed_ values scaled by sigma_.
+    /// Output: out[i] = centroids_[sq_packed_[i]] * sigma_
+    void dequantizeBatch(float* __restrict__ out, const size_t count) const {
+        for (size_t i = 0; i < count; ++i) {
+            out[i] = centroids_[sq_packed_[i]] * sigma_;
+        }
+    }
+
+    // -- Encoded data --------------------------------------------------------
+
     /// SQ indices, one uint8_t per coordinate [dim elements].
     /// Each value in [0, 2^mse_bits - 1].
     /// Note: 1 byte per index is wasteful for 3-bit; tight packing is Phase 2.
@@ -233,6 +349,10 @@ class TurboQuantEncoder {
     int num_boundaries_;
     const float* centroids_;
 
+    /// Precomputed sign vectors for RHT — fixed for a given seed, shared by all vectors.
+    std::vector<float> rotation_signs_;
+    std::vector<float> qjl_signs_precomp_;
+
  public:
     TurboQuantEncoder(size_t d, int bits_per_coord = 4,
                       uint64_t rot_seed = 42, uint64_t q_seed = 137)
@@ -252,16 +372,19 @@ class TurboQuantEncoder {
                && "TurboQuantEncoder: need at least 2 bits (1 MSE + 1 QJL)");
 
         if (mse_bits_ == 3) {
-            boundaries_ = detail::LM3_BOUNDARIES;
+            boundaries_ = detail::LM3.boundaries.data();
             num_boundaries_ = 7;
-            centroids_ = detail::LM3_CENTROIDS;
+            centroids_ = detail::LM3.centroids.data();
         } else if (mse_bits_ == 4) {
-            boundaries_ = detail::LM4_BOUNDARIES;
+            boundaries_ = detail::LM4.boundaries.data();
             num_boundaries_ = 15;
-            centroids_ = detail::LM4_CENTROIDS;
+            centroids_ = detail::LM4.centroids.data();
         } else {
             assert(false && "TurboQuantEncoder: only b=4 (3-bit) and b=5 (4-bit) are implemented");
         }
+
+        rotation_signs_ = generateSigns(dim_, rotation_seed_);
+        qjl_signs_precomp_ = generateSigns(dim_, qjl_seed_);
     }
 
     // -- Accessors ----------------------------------------------------------
@@ -269,8 +392,14 @@ class TurboQuantEncoder {
     size_t dim() const { return dim_; }
     int totalBits() const { return total_bits_; }
     int mseBits() const { return mse_bits_; }
-    uint64_t rotationSeed() const { return rotation_seed_; }
-    const float* centroids() const { return centroids_; }
+    const float* rotationSigns() const { return rotation_signs_.data(); }
+    const float* qjlSigns() const { return qjl_signs_precomp_.data(); }
+
+    /// Create an empty TurboQuantCode pre-configured with this encoder's
+    /// quantization tables (boundaries/centroids).
+    TurboQuantCode createCode() const {
+        return TurboQuantCode(boundaries_, num_boundaries_, centroids_);
+    }
 
     // -----------------------------------------------------------------------
     // QUANTprod(x) — Algorithm 2: Encode
@@ -281,7 +410,7 @@ class TurboQuantEncoder {
     TurboQuantCode encode(const float* raw) const {
         assert(raw != nullptr && "encode: null input pointer");
 
-        TurboQuantCode code;
+        TurboQuantCode code = createCode();
 
         // Step 1: Compute and store original norm
         float norm_sq = 0.0f;
@@ -292,7 +421,7 @@ class TurboQuantEncoder {
         std::vector<float> rotated(dim_);
         float inv_norm = (code.norm_ > 1e-10f) ? (1.0f / code.norm_) : 0.0f;
         for (size_t i = 0; i < dim_; ++i) rotated[i] = raw[i] * inv_norm;
-        randomizedHadamard(rotated.data(), dim_, rotation_seed_);
+        randomizedHadamard(rotated.data(), rotation_signs_.data(), dim_);
 
         // Step 3: Compute sigma (std dev of rotated coords) for Lloyd-Max rescaling
         float var = 0.0f;
@@ -303,14 +432,16 @@ class TurboQuantEncoder {
         float inv_sigma = 1.0f / sigma;
 
         // Step 4: SQ quantize with (b-1) bits and compute residual
-        code.sq_packed_.resize(dim_, 0);
+        std::vector<float> normalized(dim_);
+        for (size_t i = 0; i < dim_; ++i) normalized[i] = rotated[i] * inv_sigma;
+        code.quantizeBatch(normalized.data(), dim_);
+
+        std::vector<float> reconstructed(dim_);
+        code.dequantizeBatch(reconstructed.data(), dim_);
+
         std::vector<float> residual(dim_);
         for (size_t i = 0; i < dim_; ++i) {
-            float normalized = rotated[i] * inv_sigma;
-            uint8_t idx = sqQuantize(normalized, boundaries_, num_boundaries_);
-            float reconstructed = sqDequantize(idx, centroids_) * sigma;
-            residual[i] = rotated[i] - reconstructed;
-            code.sq_packed_[i] = idx;
+            residual[i] = rotated[i] - reconstructed[i];
         }
 
         // Step 5: γ = ‖residual‖₂
@@ -321,7 +452,7 @@ class TurboQuantEncoder {
         // Step 6: QJL sign sketch — qjl_signs = sign(S · residual)
         //         S implemented as RHT with qjl_seed (orthogonal, O(d log d))
         std::vector<float> projected(residual);
-        randomizedHadamard(projected.data(), dim_, qjl_seed_);
+        randomizedHadamard(projected.data(), qjl_signs_precomp_.data(), dim_);
 
         size_t num_words = (dim_ + 63) / 64;
         code.qjl_signs_.resize(num_words, 0);
@@ -367,19 +498,19 @@ class TurboQuantEncoder {
 
         std::vector<float> q_rot(dim_);
         for (size_t i = 0; i < dim_; ++i) q_rot[i] = raw_query[i] * q_inv;
-        randomizedHadamard(q_rot.data(), dim_, rotation_seed_);
+        randomizedHadamard(q_rot.data(), rotation_signs_.data(), dim_);
 
         // Term 1: ⟨q_rot, x̃_mse_rot⟩  (gather: dequant + dot product)
+        std::vector<float> mse_recon(dim_);
+        code.dequantizeBatch(mse_recon.data(), dim_);
         float ip_mse = 0.0f;
         for (size_t i = 0; i < dim_; ++i) {
-            float centroid_val = sqDequantize(code.sq_packed_[i], centroids_)
-                                 * code.sigma_;
-            ip_mse += q_rot[i] * centroid_val;
+            ip_mse += q_rot[i] * mse_recon[i];
         }
 
         // Term 2: QJL correction — (√(π/2)/√d) · γ · ⟨S·q_rot, qjl⟩
         std::vector<float> s_q(q_rot);
-        randomizedHadamard(s_q.data(), dim_, qjl_seed_);
+        randomizedHadamard(s_q.data(), qjl_signs_precomp_.data(), dim_);
 
         // ⟨S·q_rot, qjl⟩: bit=1 → qjl=+1, bit=0 → qjl=-1
         float dot_qjl = 0.0f;
