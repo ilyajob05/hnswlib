@@ -25,6 +25,7 @@ set(EXAMPLE_NAMES
     example_multivector_search
     example_replace_deleted
     example_search
+    example_turbo_quant
     )
 
 set(TEST_NAMES
@@ -244,6 +245,16 @@ if(HNSWLIB_EXAMPLES)
 
     # This test deviates from the above pattern of naming test executables.
     add_example_or_test(test_updates tests/cpp/updates_test.cpp)
+
+    # BigANN benchmark (not included in ctest — requires external data files).
+    add_executable(turbo_quant_bigann_test tests/cpp/turbo_quant_bigann_test.cpp)
+    target_link_libraries(turbo_quant_bigann_test hnswlib)
+    target_compile_options(turbo_quant_bigann_test PUBLIC ${ENABLE_EXCEPTIONS_FLAGS})
+
+    # Multi-dataset recall vs QPS benchmark (not included in ctest — requires external data files).
+    add_executable(turbo_quant_recall_vs_qps tests/cpp/turbo_quant_recall_vs_qps.cpp)
+    target_link_libraries(turbo_quant_recall_vs_qps hnswlib)
+    target_compile_options(turbo_quant_recall_vs_qps PUBLIC ${ENABLE_EXCEPTIONS_FLAGS})
 
     # For historical reasons, the "main" program links with sift_1b.cpp.
     add_example_or_test(main tests/cpp/main.cpp tests/cpp/sift_1b.cpp)
