@@ -614,6 +614,11 @@ struct TurboQuantPreparedQuery {
     std::vector<float> s_q;     ///< RHT(q_rot, qjl_signs) for QJL correction
     float q_norm_sq;            ///< ||query||^2
     float q_norm;               ///< ||query||
+
+    /// ADC lookup table: lut[i * num_levels + j] = q_rot[i] * centroids[j].
+    /// Precomputed once per query; eliminates per-candidate multiply in distSearch.
+    std::vector<float> lut;
+    int num_levels;             ///< number of SQ centroid levels (8 or 16)
 };
 
 }  // namespace turboquant

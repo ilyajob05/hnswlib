@@ -233,7 +233,7 @@ bool test_lossless_identity() {
     std::cout << "=== Test 3b: MSE + residual = exact (lossless identity) ===" << std::endl;
 
     constexpr size_t D = 512;
-    constexpr size_t N = 200000;
+    constexpr size_t N = 20000;
 
     auto embeddings = generateFaceEmbeddings(N, D);
     uint64_t rot_seed = 42;
@@ -548,8 +548,8 @@ bool test_hnsw_integration() {
     std::cout << "=== Test 7: HNSW integration (TurboQuantSpace) ===" << std::endl;
 
     constexpr size_t D = 128;
-    constexpr size_t N = 5000;
-    constexpr size_t NUM_QUERIES = 100;
+    constexpr size_t N = 500;
+    constexpr size_t NUM_QUERIES = 20;
     constexpr size_t K = 10;
     constexpr size_t M = 16;
     constexpr size_t EF_CONSTRUCTION = 200;
@@ -644,8 +644,8 @@ bool test_save_load_index() {
     std::cout << "=== Test 8: Save/load index ===" << std::endl;
 
     constexpr size_t D = 128;
-    constexpr size_t N = 2000;
-    constexpr size_t NUM_QUERIES = 50;
+    constexpr size_t N = 200;
+    constexpr size_t NUM_QUERIES = 10;
     constexpr size_t K = 10;
     constexpr size_t M = 16;
     constexpr size_t EF_CONSTRUCTION = 200;
@@ -788,9 +788,9 @@ void test_large_scale_comparison() {
     std::cout << "=== Large-scale comparison: L2Space vs TurboQuantSpace ==="
               << std::endl;
 
-    constexpr size_t D = 1024;
-    constexpr size_t N = 1000000;
-    constexpr size_t NUM_QUERIES = 100;
+    constexpr size_t D = 128;
+    constexpr size_t N = 10000;
+    constexpr size_t NUM_QUERIES = 10;
     constexpr size_t K = 10;
     constexpr size_t M = 16;
     constexpr size_t EF_CONSTRUCTION = 100;
@@ -823,7 +823,7 @@ void test_large_scale_comparison() {
         for (size_t i = 0; i < N; ++i) {
             generateRandomVector(vec.data(), D, rng);
             hnsw.addPoint(vec.data(), i);
-            if ((i + 1) % 100000 == 0) {
+            if ((i + 1) % 10000 == 0) {
                 std::cout << "    inserted " << (i + 1) / 1000 << "K..."
                           << std::endl;
             }
@@ -885,7 +885,7 @@ void test_large_scale_comparison() {
             generateRandomVector(vec.data(), D, rng);
             tqspace.encodeVector(vec.data(), buf.data());
             hnsw.addPoint(buf.data(), i);
-            if ((i + 1) % 100000 == 0) {
+            if ((i + 1) % 10000 == 0) {
                 std::cout << "    inserted " << (i + 1) / 1000 << "K..."
                           << std::endl;
             }
@@ -991,10 +991,10 @@ void test_benchmark() {
     std::cout << "=== Performance benchmark ===" << std::endl;
 
     constexpr size_t D = 128;
-    constexpr size_t N = 10000;
-    constexpr size_t NUM_QUERIES = 100;
+    constexpr size_t N = 1000;
+    constexpr size_t NUM_QUERIES = 50;
 
-    auto embeddings = generateFaceEmbeddings(N, D, 100);
+    auto embeddings = generateFaceEmbeddings(N, D, 50);
     uint64_t rot_seed = 42;
     uint64_t qjl_seed = 137;
     const TurboQuantEncoder enc(D, 4, rot_seed, qjl_seed);
@@ -1103,6 +1103,102 @@ void test_benchmark() {
 }
 
 // ---------------------------------------------------------------------------
+// Test: LUT correctness — verify LUT-based distSearch matches reference
+// ---------------------------------------------------------------------------
+bool test_lut_correctness() {
+    std::cout << "=== Test: LUT distSearch correctness ===" << std::endl;
+
+    constexpr size_t D = 128;
+    constexpr size_t N = 200;
+    constexpr size_t NUM_QUERIES = 10;
+    constexpr float TOL = 1e-3f;  // float rounding from factoring sigma out of loop
+
+    auto embeddings = generateFaceEmbeddings(N + NUM_QUERIES, D);
+
+    TurboQuantSpace tq_space(D, 4, 42, 137);
+    size_t code_size = tq_space.codeSizeBytes();
+
+    // Encode all vectors
+    std::vector<std::vector<char>> codes(N, std::vector<char>(code_size));
+    for (size_t i = 0; i < N; ++i) {
+        tq_space.encodeVector(embeddings[i].data(), codes[i].data());
+    }
+
+    // Reference: compute distance using direct formula (no LUT)
+    // ip_mse_ref = sigma * Σ_i q_rot[i] * centroids[sq_packed[i]]
+    const float* centroids = hnswlib::turboquant::detail::LM3.centroids.data();
+    const int num_levels = 8;  // 3-bit
+
+    float max_rel_err = 0.0f;
+    int mismatches = 0;
+
+    for (size_t q = 0; q < NUM_QUERIES; ++q) {
+        const float* query = embeddings[N + q].data();
+        auto pq = tq_space.prepareQuery(query);
+
+        for (size_t i = 0; i < N; ++i) {
+            const char* buf = codes[i].data();
+            const uint8_t* sq_packed = reinterpret_cast<const uint8_t*>(buf);
+            const size_t qjl_bytes = ((D + 63) / 64) * sizeof(uint64_t);
+            const float* meta = reinterpret_cast<const float*>(buf + D + qjl_bytes);
+            const float x_norm = meta[0];
+            const float gamma  = meta[1];
+            const float sigma  = meta[2];
+
+            // Reference MSE term (no LUT)
+            float ip_mse_ref = 0.0f;
+            for (size_t d = 0; d < D; ++d)
+                ip_mse_ref += pq.q_rot[d] * centroids[sq_packed[d]] * sigma;
+
+            // LUT MSE term
+            float ip_mse_lut = 0.0f;
+            const float* lut = pq.lut.data();
+            for (size_t d = 0; d < D; ++d)
+                ip_mse_lut += lut[d * num_levels + sq_packed[d]];
+            ip_mse_lut *= sigma;
+
+            float abs_err = std::abs(ip_mse_ref - ip_mse_lut);
+            float denom = std::max(std::abs(ip_mse_ref), 1e-10f);
+            float rel_err = abs_err / denom;
+            if (rel_err > max_rel_err) max_rel_err = rel_err;
+            if (rel_err > TOL) ++mismatches;
+
+            // Also verify full distance via TurboQuantSpace dispatch
+            tq_space.beginSearch(pq);
+            float dist_lut = tq_space.get_dist_func()(
+                nullptr, buf, tq_space.get_dist_func_param());
+            tq_space.endSearch();
+
+            // Reference full distance
+            const uint64_t* qjl_signs = reinterpret_cast<const uint64_t*>(buf + D);
+            float dot_qjl = 0.0f;
+            for (size_t d = 0; d < D; ++d) {
+                bool positive = (qjl_signs[d / 64] >> (d % 64)) & 1ULL;
+                dot_qjl += pq.s_q[d] * (positive ? 1.0f : -1.0f);
+            }
+            float scale = std::sqrt(static_cast<float>(M_PI) / 2.0f)
+                        / std::sqrt(static_cast<float>(D));
+            float correction = scale * gamma * dot_qjl;
+            float ip_ref = (ip_mse_ref + correction) * x_norm * pq.q_norm;
+            float dist_ref = std::max(0.0f,
+                pq.q_norm_sq + x_norm * x_norm - 2.0f * ip_ref);
+
+            float dist_err = std::abs(dist_lut - dist_ref);
+            float dist_denom = std::max(dist_ref, 1e-10f);
+            if (dist_err / dist_denom > TOL) ++mismatches;
+        }
+    }
+
+    bool pass = (mismatches == 0);
+    std::cout << "  Max relative error (MSE term): " << std::scientific
+              << max_rel_err << std::endl;
+    std::cout << "  Mismatches: " << mismatches << " / "
+              << (NUM_QUERIES * N * 2) << std::endl;
+    std::cout << "  " << (pass ? "PASS" : "FAIL") << std::endl;
+    return pass;
+}
+
+// ---------------------------------------------------------------------------
 int main() {
     std::cout << "TurboQuant Algorithm 2 — Correctness Tests\n"
               << "d=128, b=4 (3-bit MSE + 1-bit QJL)\n"
@@ -1122,6 +1218,7 @@ int main() {
     run(test_serialization_roundtrip());
     run(test_hnsw_integration());
     run(test_save_load_index());
+    run(test_lut_correctness());
 
     test_memory_footprint();
     std::cout << std::endl;

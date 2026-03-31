@@ -32,9 +32,11 @@ namespace turboquant {
 // ===========================================================================
 
 struct TurboQuantDistParam {
-    size_t dim;
-    const float* centroids;
+    const size_t dim;
+    const float* centroids;           ///< set in constructor body (after LM table selection)
     const TurboQuantPreparedQuery* prepared_query;  ///< non-null = search mode
+    const int num_levels;             ///< number of SQ centroid levels (8 or 16)
+    const float scale;
 };
 
 // ===========================================================================
@@ -80,17 +82,18 @@ class TurboQuantSpace : public SpaceInterface<float> {
         const float sigma   = meta[2];
 
         float ip_mse = 0.0f;
+        const int num_levels = pq->num_levels;
+        const float* lut = pq->lut.data();
         for (size_t i = 0; i < dim; ++i)
-            ip_mse += pq->q_rot[i] * p->centroids[sq_packed[i]] * sigma;
+            ip_mse += lut[i * num_levels + sq_packed[i]];
+        ip_mse *= sigma;
 
         float dot_qjl = 0.0f;
         for (size_t i = 0; i < dim; ++i) {
             const bool positive = (qjl_signs[i / 64] >> (i % 64)) & 1ULL;
             dot_qjl += pq->s_q[i] * (positive ? 1.0f : -1.0f);
         }
-        const float scale = std::sqrt(static_cast<float>(M_PI) / 2.0f)
-                          / std::sqrt(static_cast<float>(dim));
-        const float correction = scale * gamma * dot_qjl;
+        const float correction = p->scale * gamma * dot_qjl;
 
         const float ip = (ip_mse + correction) * x_norm * pq->q_norm;
         return std::max(0.0f, pq->q_norm_sq + x_norm * x_norm - 2.0f * ip);
@@ -200,6 +203,7 @@ class TurboQuantSpace : public SpaceInterface<float> {
         , boundaries_(nullptr)
         , num_boundaries_(0)
         , centroids_(nullptr)
+        , dist_param_{dim_, centroids_, nullptr, (1<<mse_bits_), std::sqrtf(M_PI / 2.0f) / std::sqrtf(static_cast<float>(dim_))}
     {
         assert(dim >= 4 && "TurboQuantSpace: dim must be at least 4");
         assert((dim & (dim - 1)) == 0
@@ -216,12 +220,9 @@ class TurboQuantSpace : public SpaceInterface<float> {
         } else {
             assert(false && "TurboQuantSpace: only 4-bit and 5-bit modes");
         }
+        dist_param_.centroids = centroids_;
         rotation_signs_ = generateSigns(dim_, rot_seed);
         qjl_signs_ = generateSigns(dim_, qjl_seed);
-
-        dist_param_.dim = dim_;
-        dist_param_.centroids = centroids_;
-        dist_param_.prepared_query = nullptr;
     }
 
     // -- SpaceInterface -------------------------------------------------------
@@ -258,6 +259,16 @@ class TurboQuantSpace : public SpaceInterface<float> {
         pq.q_rot.resize(d);
         for (size_t i = 0; i < d; ++i) pq.q_rot[i] = raw_query[i] * q_inv;
         randomizedHadamard(pq.q_rot.data(), rotation_signs_.data(), d);
+
+        // ADC lookup table: lut[i * num_levels + j] = q_rot[i] * centroids[j]
+        const int num_levels = (1 << mse_bits_);
+        pq.num_levels = num_levels;
+        pq.lut.resize(d * num_levels);
+        for (size_t i = 0; i < d; ++i) {
+            for (int j = 0; j < num_levels; ++j) {
+                pq.lut[i * num_levels + j] = pq.q_rot[i] * centroids_[j];
+            }
+        }
 
         pq.s_q = pq.q_rot;
         randomizedHadamard(pq.s_q.data(), qjl_signs_.data(), d);
