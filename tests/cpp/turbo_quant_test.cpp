@@ -19,8 +19,10 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <numeric>
 #include <random>
+#include <thread>
 #include <vector>
 
 #ifdef __APPLE__
@@ -460,7 +462,7 @@ void test_memory_footprint() {
   constexpr size_t D = 128;
   uint64_t rot_seed = 42;
   uint64_t qjl_seed = 137;
-  const TurboQuantEncoder enc(D, 4, rot_seed, qjl_seed);
+  const TurboQuantEncoder enc(D, 8, rot_seed, qjl_seed);
 
   size_t raw_bytes = D * sizeof(float);
   size_t tq_bytes = enc.codeSizeBytes();
@@ -583,6 +585,7 @@ bool test_hnsw_integration(int bits_per_coord = 4) {
   }
 
   hnsw.setEf(64);
+  space.setSearchMode(hnsw);
 
   // Search and measure recall
   std::mt19937_64 rng(555);
@@ -603,9 +606,7 @@ bool test_hnsw_integration(int bits_per_coord = 4) {
 
     // HNSW search with prepared query
     auto pq = space.prepareQuery(query);
-    space.beginSearch(pq);
-    auto result = hnsw.searchKnn(query, K);
-    space.endSearch();
+    auto result = hnsw.searchKnn(&pq, K);
 
     // Collect HNSW results
     std::vector<size_t> hnsw_ids;
@@ -677,6 +678,7 @@ bool test_save_load_index(int bits_per_coord = 4) {
     hnsw.addPoint(buf.data(), i);
   }
   hnsw.setEf(64);
+  space.setSearchMode(hnsw);
 
   // Search before save — collect results for comparison
   std::mt19937_64 rng(333);
@@ -689,9 +691,7 @@ bool test_save_load_index(int bits_per_coord = 4) {
   for (size_t q = 0; q < NUM_QUERIES; ++q) {
     const float *query = embeddings[query_indices[q]].data();
     auto pq = space.prepareQuery(query);
-    space.beginSearch(pq);
-    auto result = hnsw.searchKnn(query, K);
-    space.endSearch();
+    auto result = hnsw.searchKnn(&pq, K);
     while (!result.empty()) {
       results_before[q].push_back(result.top().second);
       result.pop();
@@ -706,6 +706,7 @@ bool test_save_load_index(int bits_per_coord = 4) {
   // Load into a new index (same space, fresh HierarchicalNSW)
   hnswlib::HierarchicalNSW<float> hnsw2(&space, filename);
   hnsw2.setEf(64);
+  space.setSearchMode(hnsw2);
 
   // Search after load — results must be identical
   bool all_match = true;
@@ -715,9 +716,7 @@ bool test_save_load_index(int bits_per_coord = 4) {
     const float *query = embeddings[query_indices[q]].data();
 
     auto pq = space.prepareQuery(query);
-    space.beginSearch(pq);
-    auto result = hnsw2.searchKnn(query, K);
-    space.endSearch();
+    auto result = hnsw2.searchKnn(&pq, K);
 
     std::vector<size_t> results_after;
     while (!result.empty()) {
@@ -880,12 +879,12 @@ void test_large_scale_comparison() {
   // -----------------------------------------------------------------------
   // Part B: TurboQuantSpace HNSW
   // -----------------------------------------------------------------------
-  std::cout << "\n  --- TurboQuantSpace (3-bit SQ + 1-bit QJL) ---"
+  std::cout << "\n  --- TurboQuantSpace (7-bit SQ + 1-bit QJL) ---"
             << std::endl;
   {
     uint64_t rot_seed = 42;
     uint64_t qjl_seed = 137;
-    TurboQuantSpace tqspace(D, 4, rot_seed, qjl_seed);
+    TurboQuantSpace tqspace(D, 8, rot_seed, qjl_seed);
     size_t rss_before = getCurrentRSS();
 
     auto t0 = std::chrono::high_resolution_clock::now();
@@ -914,12 +913,11 @@ void test_large_scale_comparison() {
 
     // Search
     hnsw.setEf(EF_SEARCH);
+    tqspace.setSearchMode(hnsw);
     t0 = std::chrono::high_resolution_clock::now();
     for (size_t q = 0; q < NUM_QUERIES; ++q) {
       auto pq = tqspace.prepareQuery(queries[q].data());
-      tqspace.beginSearch(pq);
-      auto result = hnsw.searchKnn(queries[q].data(), K);
-      tqspace.endSearch();
+      auto result = hnsw.searchKnn(&pq, K);
       (void)result;
     }
     t1 = std::chrono::high_resolution_clock::now();
@@ -949,9 +947,7 @@ void test_large_scale_comparison() {
 
       // HNSW result
       auto pq = tqspace.prepareQuery(query);
-      tqspace.beginSearch(pq);
-      auto result = hnsw.searchKnn(query, K);
-      tqspace.endSearch();
+      auto result = hnsw.searchKnn(&pq, K);
       std::vector<size_t> hnsw_ids;
       while (!result.empty()) {
         hnsw_ids.push_back(result.top().second);
@@ -1009,7 +1005,7 @@ void test_benchmark() {
   auto embeddings = generateFaceEmbeddings(N, D, 50);
   uint64_t rot_seed = 42;
   uint64_t qjl_seed = 137;
-  const TurboQuantEncoder enc(D, 4, rot_seed, qjl_seed);
+  const TurboQuantEncoder enc(D, 8, rot_seed, qjl_seed);
 
   // 1. Encode throughput
   std::vector<TurboQuantCode> codes(N);
@@ -1072,15 +1068,13 @@ void test_benchmark() {
   }
 
   t0 = std::chrono::high_resolution_clock::now();
-  auto dist_func = space.get_dist_func();
+  auto dist_func = space.getSearchDistFunc();
   auto *dist_param = space.get_dist_func_param();
   for (size_t q = 0; q < NUM_QUERIES; ++q) {
     auto pq = space.prepareQuery(embeddings[q].data());
-    space.beginSearch(pq);
     for (size_t i = 0; i < N; ++i) {
-      sink = dist_func(embeddings[q].data(), flat_codes[i].data(), dist_param);
+      sink = dist_func(&pq, flat_codes[i].data(), dist_param);
     }
-    space.endSearch();
   }
   t1 = std::chrono::high_resolution_clock::now();
   double prepared_us =
@@ -1180,11 +1174,9 @@ bool test_lut_correctness(int bits_per_coord = 4) {
       if (rel_err > TOL)
         ++mismatches;
 
-      // Also verify full distance via TurboQuantSpace dispatch
-      tq_space.beginSearch(pq);
-      float dist_lut = tq_space.get_dist_func()(nullptr, buf,
-                                                tq_space.get_dist_func_param());
-      tq_space.endSearch();
+      // Also verify full distance via TurboQuantSpace search dispatch
+      float dist_lut = tq_space.getSearchDistFunc()(&pq, buf,
+                                                     tq_space.get_dist_func_param());
 
       // Reference full distance
       const int8_t *qjl_signs = reinterpret_cast<const int8_t *>(buf + D);
@@ -1212,6 +1204,330 @@ bool test_lut_correctness(int bits_per_coord = 4) {
             << std::endl;
   std::cout << "  " << (pass ? "PASS" : "FAIL") << std::endl;
   return pass;
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: TurboQuantIndex — build, save, load, search, searchRerank
+// ---------------------------------------------------------------------------
+bool test_turbo_quant_index() {
+  std::cout << "=== Test 9: TurboQuantIndex ===" << std::endl;
+
+  constexpr size_t D = 128;
+  constexpr size_t N = 2000;
+  constexpr size_t NUM_QUERIES = 50;
+  constexpr size_t K = 10;
+  constexpr size_t M = 16;
+  constexpr size_t EF_CONSTRUCTION = 200;
+
+  auto embeddings = generateFaceEmbeddings(N, D, 100);
+
+  // Flat contiguous array
+  std::vector<float> flat(N * D);
+  for (size_t i = 0; i < N; ++i)
+    std::memcpy(flat.data() + i * D, embeddings[i].data(), D * sizeof(float));
+
+  // Build
+  TurboQuantIndex idx(D, 8);
+  auto st = idx.build(flat.data(), N, M, EF_CONSTRUCTION);
+  if (!st.ok()) {
+    std::cout << "  Build failed: " << st.message() << "  FAIL" << std::endl;
+    return false;
+  }
+  std::cout << "  Built: " << idx.numElements() << " vectors, "
+            << idx.codeSizeBytes() << " B/code" << std::endl;
+
+  // Save with raw vectors
+  const std::string idx_path = "test_tqi_index.bin";
+  const std::string raw_path = "test_tqi_raw.tqrv";
+  st = idx.save(idx_path, raw_path, flat.data(), N);
+  if (!st.ok()) {
+    std::cout << "  Save failed: " << st.message() << "  FAIL" << std::endl;
+    return false;
+  }
+
+  // Load
+  TurboQuantIndex idx2(D, 8);
+  st = idx2.load(idx_path, raw_path);
+  if (!st.ok()) {
+    std::cout << "  Load failed: " << st.message() << "  FAIL" << std::endl;
+    return false;
+  }
+  std::cout << "  Loaded: " << idx2.numElements() << " vectors, hasRaw="
+            << idx2.hasRawVectors() << std::endl;
+
+  // Exact brute-force ground truth
+  std::mt19937_64 rng(777);
+  std::uniform_int_distribution<size_t> query_dist(0, N - 1);
+
+  idx2.setEf(64);
+  size_t search_hits = 0;
+  size_t rerank_hits = 0;
+
+  for (size_t q = 0; q < NUM_QUERIES; ++q) {
+    size_t qi = query_dist(rng);
+    const float *query = embeddings[qi].data();
+
+    // Exact top-K
+    std::vector<std::pair<float, size_t>> exact_dists(N);
+    for (size_t i = 0; i < N; ++i)
+      exact_dists[i] = {l2_dist(query, embeddings[i].data(), D), i};
+    std::partial_sort(exact_dists.begin(), exact_dists.begin() + K,
+                      exact_dists.end());
+
+    // TQ search
+    auto result = idx2.search(query, K);
+    std::vector<size_t> search_ids;
+    while (!result.empty()) {
+      search_ids.push_back(result.top().second);
+      result.pop();
+    }
+    for (size_t i = 0; i < K; ++i)
+      for (size_t j = 0; j < search_ids.size(); ++j)
+        if (search_ids[j] == exact_dists[i].second) { ++search_hits; break; }
+
+    // Rerank search
+    auto rerank = idx2.searchRerank(query, K, 100);
+    for (size_t i = 0; i < K; ++i)
+      for (size_t j = 0; j < rerank.size(); ++j)
+        if (rerank[j].second == exact_dists[i].second) { ++rerank_hits; break; }
+  }
+
+  float search_recall = static_cast<float>(search_hits) /
+                         static_cast<float>(NUM_QUERIES * K);
+  float rerank_recall = static_cast<float>(rerank_hits) /
+                         static_cast<float>(NUM_QUERIES * K);
+
+  // Cleanup
+  std::remove(idx_path.c_str());
+  std::remove(raw_path.c_str());
+
+  // Rerank should be better than or equal to TQ-only
+  bool pass = search_recall > 0.50f && rerank_recall >= search_recall;
+  std::cout << "  Search recall@" << K << ": " << std::fixed
+            << std::setprecision(2) << (search_recall * 100.0f) << "%"
+            << std::endl;
+  std::cout << "  Rerank recall@" << K << ": " << (rerank_recall * 100.0f)
+            << "%";
+  if (!pass) {
+    std::cout << "  FAIL";
+  } else {
+    std::cout << "  PASS";
+  }
+  std::cout << std::endl;
+  return pass;
+}
+
+// ---------------------------------------------------------------------------
+// Multithread benchmark: build + search scaling at 1,4,8,16,32 threads
+// Compares L2Space (float32) vs TurboQuantSpace (q8) to test the hypothesis
+// that compressed codes improve memory-bandwidth-limited throughput.
+// ---------------------------------------------------------------------------
+void test_multithread_scaling() {
+  std::cout << "=== Multithread scaling: L2 vs TurboQuant (q8) ===" << std::endl;
+
+  constexpr size_t D = 128;
+  constexpr size_t N = 50000;
+  constexpr size_t NUM_QUERIES = 5000;
+  constexpr size_t K = 10;
+  constexpr size_t M = 16;
+  constexpr size_t EF_CONSTRUCTION = 100;
+  constexpr size_t EF_SEARCH = 64;
+  constexpr int NUM_RUNS = 3; // median of N runs for stable results
+
+  const std::vector<int> thread_counts = {1, 4, 8, 16, 32, 64};
+
+  // Pre-generate all data
+  std::cout << "  Generating " << N << " vectors (d=" << D << ")..." << std::endl;
+  auto embeddings = generateFaceEmbeddings(N, D, 200);
+
+  std::mt19937_64 qrng(99999);
+  std::vector<std::vector<float>> queries(NUM_QUERIES, std::vector<float>(D));
+  for (size_t q = 0; q < NUM_QUERIES; ++q)
+    generateRandomVector(queries[q].data(), D, qrng);
+
+  // Pre-encode TQ codes for build benchmark
+  uint64_t rot_seed = 42;
+  uint64_t qjl_seed = 137;
+  TurboQuantSpace tq_space_ref(D, 8, rot_seed, qjl_seed);
+  size_t code_size = tq_space_ref.codeSizeBytes();
+  std::vector<std::vector<char>> tq_codes(N, std::vector<char>(code_size));
+  for (size_t i = 0; i < N; ++i)
+    tq_space_ref.encodeVector(embeddings[i].data(), tq_codes[i].data());
+
+  std::cout << "  data_size/vec: L2=" << D * sizeof(float)
+            << " B, TQ=" << code_size << " B ("
+            << std::fixed << std::setprecision(1)
+            << float(D * sizeof(float)) / code_size << "x compression)"
+            << std::endl;
+
+  // Header
+  std::cout << "\n  "
+            << std::setw(8) << "threads"
+            << std::setw(14) << "L2_build_s"
+            << std::setw(14) << "TQ_build_s"
+            << std::setw(14) << "L2_qps"
+            << std::setw(14) << "TQ_qps"
+            << std::setw(12) << "build_ratio"
+            << std::setw(12) << "search_ratio"
+            << std::endl;
+  std::cout << "  " << std::string(88, '-') << std::endl;
+
+  // Helper: median of measurements
+  auto medianOf = [](std::vector<double> &v) -> double {
+    std::sort(v.begin(), v.end());
+    return v[v.size() / 2];
+  };
+
+  // Build L2 index once (single-threaded — build scaling tested separately)
+  std::cout << "  Building L2 index..." << std::flush;
+  hnswlib::L2Space l2space(D);
+  hnswlib::HierarchicalNSW<float> hnsw_l2(&l2space, N, M, EF_CONSTRUCTION);
+  for (size_t i = 0; i < N; ++i)
+    hnsw_l2.addPoint(embeddings[i].data(), i);
+  hnsw_l2.setEf(EF_SEARCH);
+  std::cout << " done" << std::endl;
+
+  // Build TQ index once
+  std::cout << "  Building TQ index..." << std::flush;
+  TurboQuantSpace tq_space_bench(D, 8, rot_seed, qjl_seed);
+  hnswlib::HierarchicalNSW<float> hnsw_tq(&tq_space_bench, N, M, EF_CONSTRUCTION);
+  for (size_t i = 0; i < N; ++i)
+    hnsw_tq.addPoint(tq_codes[i].data(), i);
+  hnsw_tq.setEf(EF_SEARCH);
+  tq_space_bench.setSearchMode(hnsw_tq);
+  std::cout << " done" << std::endl;
+
+  // Build scaling (still per thread_count, cannot reuse)
+  std::cout << "\n  --- Build scaling ---\n  "
+            << std::setw(8) << "threads"
+            << std::setw(14) << "L2_build_s"
+            << std::setw(14) << "TQ_build_s"
+            << std::setw(12) << "build_ratio"
+            << std::endl;
+  std::cout << "  " << std::string(48, '-') << std::endl;
+
+  for (int num_threads : thread_counts) {
+    double l2_build_sec;
+    {
+      hnswlib::L2Space ls(D);
+      hnswlib::HierarchicalNSW<float> h(&ls, N, M, EF_CONSTRUCTION);
+      h.addPoint(embeddings[0].data(), 0);
+      auto t0 = std::chrono::high_resolution_clock::now();
+      std::vector<std::thread> threads;
+      size_t per_thread = (N - 1) / num_threads;
+      for (int t = 0; t < num_threads; ++t) {
+        size_t start = 1 + t * per_thread;
+        size_t end = (t == num_threads - 1) ? N : start + per_thread;
+        threads.emplace_back([&, start, end]() {
+          for (size_t i = start; i < end; ++i)
+            h.addPoint(embeddings[i].data(), i);
+        });
+      }
+      for (auto &th : threads) th.join();
+      l2_build_sec = std::chrono::duration<double>(
+          std::chrono::high_resolution_clock::now() - t0).count();
+    }
+
+    double tq_build_sec;
+    {
+      TurboQuantSpace ts(D, 8, rot_seed, qjl_seed);
+      hnswlib::HierarchicalNSW<float> h(&ts, N, M, EF_CONSTRUCTION);
+      h.addPoint(tq_codes[0].data(), 0);
+      auto t0 = std::chrono::high_resolution_clock::now();
+      std::vector<std::thread> threads;
+      size_t per_thread = (N - 1) / num_threads;
+      for (int t = 0; t < num_threads; ++t) {
+        size_t start = 1 + t * per_thread;
+        size_t end = (t == num_threads - 1) ? N : start + per_thread;
+        threads.emplace_back([&, start, end]() {
+          for (size_t i = start; i < end; ++i)
+            h.addPoint(tq_codes[i].data(), i);
+        });
+      }
+      for (auto &th : threads) th.join();
+      tq_build_sec = std::chrono::duration<double>(
+          std::chrono::high_resolution_clock::now() - t0).count();
+    }
+
+    std::cout << "  "
+              << std::setw(8) << num_threads
+              << std::setw(14) << std::fixed << std::setprecision(3) << l2_build_sec
+              << std::setw(14) << tq_build_sec
+              << std::setw(12) << std::setprecision(2) << l2_build_sec / tq_build_sec
+              << std::endl;
+  }
+
+  // Search scaling (median of NUM_RUNS runs, reusing pre-built indexes)
+  std::cout << "\n  --- Search scaling (median of " << NUM_RUNS << " runs) ---\n  "
+            << std::setw(8) << "threads"
+            << std::setw(14) << "L2_qps"
+            << std::setw(14) << "TQ_qps"
+            << std::setw(12) << "search_ratio"
+            << std::endl;
+  std::cout << "  " << std::string(48, '-') << std::endl;
+
+  for (int num_threads : thread_counts) {
+    std::vector<double> l2_times(NUM_RUNS), tq_times(NUM_RUNS);
+
+    for (int run = 0; run < NUM_RUNS; ++run) {
+      // L2 search
+      {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        std::vector<std::thread> threads;
+        size_t per_thread = NUM_QUERIES / num_threads;
+        for (int t = 0; t < num_threads; ++t) {
+          size_t start = t * per_thread;
+          size_t end = (t == num_threads - 1) ? NUM_QUERIES : start + per_thread;
+          threads.emplace_back([&, start, end]() {
+            for (size_t q = start; q < end; ++q) {
+              auto result = hnsw_l2.searchKnn(queries[q].data(), K);
+              (void)result;
+            }
+          });
+        }
+        for (auto &th : threads) th.join();
+        l2_times[run] = std::chrono::duration<double>(
+            std::chrono::high_resolution_clock::now() - t0).count();
+      }
+      // TQ search
+      {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        std::vector<std::thread> threads;
+        size_t per_thread = NUM_QUERIES / num_threads;
+        for (int t = 0; t < num_threads; ++t) {
+          size_t start = t * per_thread;
+          size_t end = (t == num_threads - 1) ? NUM_QUERIES : start + per_thread;
+          threads.emplace_back([&, start, end]() {
+            for (size_t q = start; q < end; ++q) {
+              auto pq = tq_space_bench.prepareQuery(queries[q].data());
+              auto result = hnsw_tq.searchKnn(&pq, K);
+              (void)result;
+            }
+          });
+        }
+        for (auto &th : threads) th.join();
+        tq_times[run] = std::chrono::duration<double>(
+            std::chrono::high_resolution_clock::now() - t0).count();
+      }
+    }
+
+    double l2_sec = medianOf(l2_times);
+    double tq_sec = medianOf(tq_times);
+    double l2_qps = NUM_QUERIES / l2_sec;
+    double tq_qps = NUM_QUERIES / tq_sec;
+
+    std::cout << "  "
+              << std::setw(8) << num_threads
+              << std::setw(14) << std::setprecision(0) << l2_qps
+              << std::setw(14) << tq_qps
+              << std::setw(12) << std::setprecision(2) << tq_qps / l2_qps
+              << std::endl;
+  }
+
+  std::cout << "\n  build_ratio = L2_time / TQ_time (>1 means TQ builds faster)"
+            << std::endl;
+  std::cout << "  search_ratio = TQ_qps / L2_qps (>1 means TQ searches faster)"
+            << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -1249,11 +1565,15 @@ int main() {
     run(test_lut_correctness(b));
   }
 
+  run(test_turbo_quant_index());
+
   test_memory_footprint();
   std::cout << std::endl;
   test_benchmark();
   std::cout << std::endl;
   test_large_scale_comparison();
+  std::cout << std::endl;
+  test_multithread_scaling();
   std::cout << std::endl;
 
   std::cout << "============================================" << std::endl;

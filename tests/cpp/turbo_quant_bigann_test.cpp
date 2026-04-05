@@ -240,9 +240,7 @@ static float measureRecallTQ(hnswlib::HierarchicalNSW<float> &hnsw,
   size_t total = 0;
   for (size_t q = 0; q < queries.size(); ++q) {
     auto pq = space.prepareQuery(queries[q].data());
-    space.beginSearch(pq);
-    auto result = hnsw.searchKnn(queries[q].data(), k);
-    space.endSearch();
+    auto result = hnsw.searchKnn(&pq, k);
 
     std::unordered_set<hnswlib::labeltype> gt_set;
     for (size_t j = 0; j < k && j < gt[q].size(); ++j)
@@ -477,6 +475,7 @@ int main(int argc, char **argv) {
 
       std::cout << "\n  ef\trecall@" << K << "\ttime(us/q)" << std::endl;
       std::cout << "  ----\t--------\t----------" << std::endl;
+      tqspace.setSearchMode(hnsw_tq);
       for (size_t ef : ef_values) {
         hnsw_tq.setEf(ef);
         sw.reset();
@@ -516,20 +515,18 @@ int main(int argc, char **argv) {
       for (size_t i = 0; i < BF_N; ++i)
         tqspace.encodeVector(bf_base[i].data(), codes[i].data());
 
-      auto dist_func = tqspace.get_dist_func();
+      auto dist_func = tqspace.getSearchDistFunc();
       auto *dist_param = tqspace.get_dist_func_param();
 
       size_t total_hits = 0;
       for (size_t q = 0; q < BF_Q; ++q) {
         auto pq = tqspace.prepareQuery(bf_queries[q].data());
-        tqspace.beginSearch(pq);
 
         std::vector<std::pair<float, size_t>> dists(BF_N);
         for (size_t i = 0; i < BF_N; ++i) {
           dists[i] = {
-              dist_func(bf_queries[q].data(), codes[i].data(), dist_param), i};
+              dist_func(&pq, codes[i].data(), dist_param), i};
         }
-        tqspace.endSearch();
 
         std::partial_sort(dists.begin(), dists.begin() + K, dists.end());
 
@@ -615,6 +612,7 @@ int main(int argc, char **argv) {
 
       // TQ graph + TQ search
       std::cout << "  TQ(b=" << bits_per_coord << ") graph + TQ search\t";
+      tqspace.setSearchMode(hnsw_tq);
       for (size_t ef : hy_efs) {
         hnsw_tq.setEf(ef);
         float r = measureRecallTQ(hnsw_tq, tqspace, hy_queries, hy_gt, K);
@@ -623,7 +621,7 @@ int main(int argc, char **argv) {
       std::cout << std::endl;
 
       // TQ brute-force recall at this scale
-      auto dist_func = tqspace.get_dist_func();
+      auto dist_func = tqspace.getSearchDistFunc();
       auto *dist_param = tqspace.get_dist_func_param();
 
       std::vector<std::vector<char>> codes(
@@ -636,14 +634,12 @@ int main(int argc, char **argv) {
         size_t total_hits = 0;
         for (size_t q = 0; q < HY_Q; ++q) {
           auto pq = tqspace.prepareQuery(hy_queries[q].data());
-          tqspace.beginSearch(pq);
           std::vector<std::pair<float, size_t>> dists(HY_N);
           for (size_t i = 0; i < HY_N; ++i) {
             dists[i] = {
-                dist_func(hy_queries[q].data(), codes[i].data(), dist_param),
+                dist_func(&pq, codes[i].data(), dist_param),
                 i};
           }
-          tqspace.endSearch();
           std::partial_sort(dists.begin(), dists.begin() + K, dists.end());
 
           std::unordered_set<size_t> gt_set;
@@ -711,8 +707,7 @@ int main(int argc, char **argv) {
         std::cout << "  Encode time: " << std::fixed << std::setprecision(2)
                   << encode_time << " s" << std::endl;
 
-        hnsw.fstdistfunc_ = tqspace.get_dist_func();
-        hnsw.dist_func_param_ = tqspace.get_dist_func_param();
+        tqspace.setSearchMode(hnsw);
 
         std::cout << "\n  ef\trecall@" << K << "\ttime(us/q)" << std::endl;
         std::cout << "  ----\t--------\t----------" << std::endl;
@@ -757,6 +752,7 @@ int main(int argc, char **argv) {
       }
 
       std::vector<size_t> rerank_efs = {20, 50, 100, 200, 500, 1000};
+      tqspace.setSearchMode(hnsw_tq);
 
       std::cout << "\n  ef(TQ)\trecall@" << K
                 << "\ttime(us/q)\t(shortlist → L2 re-rank → top-" << K << ")"
@@ -773,9 +769,7 @@ int main(int argc, char **argv) {
           const float *query = queries[q].data();
 
           auto pq = tqspace.prepareQuery(query);
-          tqspace.beginSearch(pq);
-          auto tq_result = hnsw_tq.searchKnn(query, ef);
-          tqspace.endSearch();
+          auto tq_result = hnsw_tq.searchKnn(&pq, ef);
 
           std::vector<std::pair<float, hnswlib::labeltype>> shortlist;
           shortlist.reserve(tq_result.size());

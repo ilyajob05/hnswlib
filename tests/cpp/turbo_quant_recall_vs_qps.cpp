@@ -211,9 +211,7 @@ static float measureRecallTQ(hnswlib::HierarchicalNSW<float> &hnsw,
   size_t total = 0;
   for (size_t q = 0; q < queries.size(); ++q) {
     auto pq = space.prepareQuery(queries[q].data());
-    space.beginSearch(pq);
-    auto result = hnsw.searchKnn(queries[q].data(), k);
-    space.endSearch();
+    auto result = hnsw.searchKnn(&pq, k);
     std::unordered_set<hnswlib::labeltype> gt_set;
     for (size_t j = 0; j < k && j < gt[q].size(); ++j)
       gt_set.insert(static_cast<hnswlib::labeltype>(gt[q][j]));
@@ -521,12 +519,10 @@ static void benchmarkTQRerank(const std::string &tag,
   // Warmup
   {
     hnsw.setEf(10);
+    tqspace.setSearchMode(hnsw);
     for (size_t q = 0; q < queries.size(); ++q) {
       auto pq = tqspace.prepareQuery(queries[q].data());
-      tqspace.beginSearch(pq);
-      auto result = hnsw.searchKnn(queries[q].data(), 10);
-      tqspace.endSearch();
-      // Discard
+      auto result = hnsw.searchKnn(&pq, 10);
       (void)result;
     }
   }
@@ -545,9 +541,7 @@ static void benchmarkTQRerank(const std::string &tag,
 
       // TQ search: retrieve ef candidates
       auto pq = tqspace.prepareQuery(query);
-      tqspace.beginSearch(pq);
-      auto tq_result = hnsw.searchKnn(query, ef);
-      tqspace.endSearch();
+      auto tq_result = hnsw.searchKnn(&pq, ef);
 
       // L2 re-rank
       std::vector<std::pair<float, hnswlib::labeltype>> shortlist;

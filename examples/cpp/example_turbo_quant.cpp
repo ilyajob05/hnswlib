@@ -191,13 +191,12 @@ int main() {
 
     // TQ search (without re-ranking)
     hnsw.setEf(64);
+    tq_space.setSearchMode(hnsw);
     std::vector<std::vector<hnswlib::labeltype>> tq_results(num_queries);
     for (size_t q = 0; q < num_queries; ++q) {
       const float *query = queries.data() + q * dim;
       auto pq = tq_space.prepareQuery(query);
-      tq_space.beginSearch(pq);
-      auto result = hnsw.searchKnn(query, K);
-      tq_space.endSearch();
+      auto result = hnsw.searchKnn(&pq, K);
 
       tq_results[q].resize(result.size());
       size_t idx = result.size();
@@ -215,9 +214,7 @@ int main() {
       const float *query = queries.data() + q * dim;
 
       auto pq = tq_space.prepareQuery(query);
-      tq_space.beginSearch(pq);
-      auto result = hnsw.searchKnn(query, rerank_ef);
-      tq_space.endSearch();
+      auto result = hnsw.searchKnn(&pq, rerank_ef);
 
       std::vector<size_t> candidate_ids;
       candidate_ids.reserve(result.size());
@@ -256,15 +253,14 @@ int main() {
     TurboQuantSpace tq_space2(dim, bits_per_coord);
     hnswlib::HierarchicalNSW<float> hnsw2(&tq_space2, index_path);
     hnsw2.setEf(64);
+    tq_space2.setSearchMode(hnsw2);
     std::cout << " done" << std::endl;
 
     std::vector<std::vector<hnswlib::labeltype>> loaded_results(num_queries);
     for (size_t q = 0; q < num_queries; ++q) {
       const float *query = queries.data() + q * dim;
       auto pq = tq_space2.prepareQuery(query);
-      tq_space2.beginSearch(pq);
-      auto result = hnsw2.searchKnn(query, K);
-      tq_space2.endSearch();
+      auto result = hnsw2.searchKnn(&pq, K);
 
       loaded_results[q].resize(result.size());
       size_t idx = result.size();

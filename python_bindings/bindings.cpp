@@ -4,6 +4,7 @@
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 #include "hnswlib.h"
+#include "turbo_quant_space.h"
 #include <thread>
 #include <atomic>
 #include <stdlib.h>
@@ -932,6 +933,182 @@ class BFIndex {
 };
 
 
+class TQIndex {
+ public:
+    size_t dim;
+    int num_threads_default;
+    hnswlib::turboquant::TurboQuantIndex tq_index;
+
+    TQIndex(size_t dim, int bits_per_coord = 8,
+            uint64_t rot_seed = 42, uint64_t qjl_seed = 137)
+        : dim(dim), tq_index(dim, bits_per_coord, rot_seed, qjl_seed) {
+        num_threads_default = std::thread::hardware_concurrency();
+    }
+
+    void build(py::object input, size_t M = 16, size_t ef_construction = 200, int num_threads = -1) {
+        py::array_t<float, py::array::c_style | py::array::forcecast> items(input);
+        auto buffer = items.request();
+        size_t rows, features;
+        get_input_array_shapes(buffer, &rows, &features);
+
+        if (features != dim)
+            HNSWLIB_THROW_RUNTIME_ERROR("Wrong dimensionality of the vectors");
+
+        if (num_threads <= 0)
+            num_threads = num_threads_default;
+
+        {
+            py::gil_scoped_release l;
+
+            tq_index.initBuild(rows, M, ef_construction);
+            size_t code_size = tq_index.codeSizeBytes();
+
+            // First element single-threaded (entry point)
+            if (rows > 0) {
+                std::vector<char> buf(code_size);
+                tq_index.addPoint(items.data(0), 0, buf.data());
+            }
+
+            // Remaining elements in parallel (same pattern as Index::addItems)
+            if (rows > 1) {
+                ParallelFor(1, rows, num_threads, [&](size_t row, size_t threadId) {
+                    // Thread-local encode buffer allocated per-thread via vector
+                    thread_local std::vector<char> buf;
+                    if (buf.size() != code_size)
+                        buf.resize(code_size);
+                    tq_index.addPoint(items.data(row), row, buf.data());
+                });
+            }
+        }
+    }
+
+    void save(const std::string &index_path, const std::string &raw_path = "",
+              py::object raw_data_obj = py::none()) {
+        const float *raw_data = nullptr;
+        size_t n = 0;
+        py::array_t<float, py::array::c_style | py::array::forcecast> raw_items;
+
+        if (!raw_data_obj.is_none()) {
+            raw_items = py::array_t<float, py::array::c_style | py::array::forcecast>(raw_data_obj);
+            auto buffer = raw_items.request();
+            size_t features;
+            get_input_array_shapes(buffer, &n, &features);
+            if (features != dim)
+                HNSWLIB_THROW_RUNTIME_ERROR("Raw data dimensionality mismatch");
+            raw_data = raw_items.data(0);
+        }
+
+        auto status = tq_index.save(index_path, raw_path, raw_data, n);
+        if (!status.ok())
+            HNSWLIB_THROW_RUNTIME_ERROR(status.message());
+    }
+
+    void load(const std::string &index_path, const std::string &raw_path = "") {
+        auto status = tq_index.load(index_path, raw_path);
+        if (!status.ok())
+            HNSWLIB_THROW_RUNTIME_ERROR(status.message());
+    }
+
+    void set_ef(size_t ef) {
+        tq_index.setEf(ef);
+    }
+
+    py::object knn_query(py::object input, size_t k = 1, int num_threads = -1) {
+        py::array_t<float, py::array::c_style | py::array::forcecast> items(input);
+        auto buffer = items.request();
+        size_t rows, features;
+        hnswlib::labeltype *data_numpy_l;
+        float *data_numpy_d;
+
+        if (num_threads <= 0)
+            num_threads = num_threads_default;
+
+        {
+            py::gil_scoped_release l;
+            get_input_array_shapes(buffer, &rows, &features);
+
+            if (rows <= static_cast<size_t>(num_threads) * 4)
+                num_threads = 1;
+
+            data_numpy_l = new hnswlib::labeltype[rows * k];
+            data_numpy_d = new float[rows * k];
+
+            ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                auto result = tq_index.search(items.data(row), k);
+                if (result.size() != k)
+                    HNSWLIB_THROW_RUNTIME_ERROR(
+                        "Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
+                for (int i = k - 1; i >= 0; i--) {
+                    auto &result_tuple = result.top();
+                    data_numpy_d[row * k + i] = result_tuple.first;
+                    data_numpy_l[row * k + i] = result_tuple.second;
+                    result.pop();
+                }
+            });
+        }
+
+        py::capsule free_when_done_l(data_numpy_l, [](void *f) { delete[] static_cast<hnswlib::labeltype*>(f); });
+        py::capsule free_when_done_d(data_numpy_d, [](void *f) { delete[] static_cast<float*>(f); });
+
+        return py::make_tuple(
+            py::array_t<hnswlib::labeltype>(
+                {rows, k}, {k * sizeof(hnswlib::labeltype), sizeof(hnswlib::labeltype)},
+                data_numpy_l, free_when_done_l),
+            py::array_t<float>(
+                {rows, k}, {k * sizeof(float), sizeof(float)},
+                data_numpy_d, free_when_done_d));
+    }
+
+    py::object knn_query_rerank(py::object input, size_t k = 1, size_t ef = 0, int num_threads = -1) {
+        py::array_t<float, py::array::c_style | py::array::forcecast> items(input);
+        auto buffer = items.request();
+        size_t rows, features;
+        hnswlib::labeltype *data_numpy_l;
+        float *data_numpy_d;
+
+        if (num_threads <= 0)
+            num_threads = num_threads_default;
+
+        {
+            py::gil_scoped_release l;
+            get_input_array_shapes(buffer, &rows, &features);
+
+            if (rows <= static_cast<size_t>(num_threads) * 4)
+                num_threads = 1;
+
+            data_numpy_l = new hnswlib::labeltype[rows * k];
+            data_numpy_d = new float[rows * k];
+
+            ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                auto result = tq_index.searchRerank(items.data(row), k, ef);
+                if (result.size() != k)
+                    HNSWLIB_THROW_RUNTIME_ERROR(
+                        "Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
+                for (size_t i = 0; i < k && i < result.size(); ++i) {
+                    data_numpy_d[row * k + i] = result[i].first;
+                    data_numpy_l[row * k + i] = result[i].second;
+                }
+            });
+        }
+
+        py::capsule free_when_done_l(data_numpy_l, [](void *f) { delete[] static_cast<hnswlib::labeltype*>(f); });
+        py::capsule free_when_done_d(data_numpy_d, [](void *f) { delete[] static_cast<float*>(f); });
+
+        return py::make_tuple(
+            py::array_t<hnswlib::labeltype>(
+                {rows, k}, {k * sizeof(hnswlib::labeltype), sizeof(hnswlib::labeltype)},
+                data_numpy_l, free_when_done_l),
+            py::array_t<float>(
+                {rows, k}, {k * sizeof(float), sizeof(float)},
+                data_numpy_d, free_when_done_d));
+    }
+
+    size_t get_current_count() { return tq_index.numElements(); }
+    bool get_has_raw_vectors() { return tq_index.hasRawVectors(); }
+    size_t get_code_size() { return tq_index.codeSizeBytes(); }
+};
+
+
 PYBIND11_PLUGIN(hnswlib) {
         py::module m("hnswlib");
 
@@ -1034,5 +1211,60 @@ PYBIND11_PLUGIN(hnswlib) {
         .def("get_max_elements", &BFIndex<float>::getMaxElements)
         .def("get_current_count", &BFIndex<float>::getCurrentCount)
         .def_readwrite("num_threads", &BFIndex<float>::num_threads_default);
+
+        py::class_<TQIndex>(m, "TQIndex")
+        .def(py::init<size_t, int, uint64_t, uint64_t>(),
+            py::arg("dim"),
+            py::arg("bits_per_coord") = 8,
+            py::arg("rot_seed") = 42,
+            py::arg("qjl_seed") = 137)
+        .def("build",
+            &TQIndex::build,
+            py::arg("data"),
+            py::arg("M") = 16,
+            py::arg("ef_construction") = 200,
+            py::arg("num_threads") = -1)
+        .def("save",
+            &TQIndex::save,
+            py::arg("index_path"),
+            py::arg("raw_path") = "",
+            py::arg("raw_data") = py::none())
+        .def("load",
+            &TQIndex::load,
+            py::arg("index_path"),
+            py::arg("raw_path") = "")
+        .def("knn_query",
+            &TQIndex::knn_query,
+            py::arg("data"),
+            py::arg("k") = 1,
+            py::arg("num_threads") = -1)
+        .def("knn_query_rerank",
+            &TQIndex::knn_query_rerank,
+            py::arg("data"),
+            py::arg("k") = 1,
+            py::arg("ef") = 0,
+            py::arg("num_threads") = -1)
+        .def("set_ef", &TQIndex::set_ef, py::arg("ef"))
+        .def("get_current_count", &TQIndex::get_current_count)
+        .def("get_has_raw_vectors", &TQIndex::get_has_raw_vectors)
+        .def("get_code_size", &TQIndex::get_code_size)
+        .def_readonly("dim", &TQIndex::dim)
+        .def_readwrite("num_threads", &TQIndex::num_threads_default)
+        .def_property("ef",
+            [](const TQIndex &idx) { return idx.tq_index.getEf(); },
+            [](TQIndex &idx, size_t ef) { idx.tq_index.setEf(ef); })
+        .def_property_readonly("element_count", [](const TQIndex &idx) {
+            return idx.tq_index.numElements();
+        })
+        .def_property_readonly("has_raw_vectors", [](const TQIndex &idx) {
+            return idx.tq_index.hasRawVectors();
+        })
+        .def_property_readonly("code_size", [](const TQIndex &idx) {
+            return idx.tq_index.codeSizeBytes();
+        })
+        .def("__repr__", [](const TQIndex &a) {
+            return "<hnswlib.TQIndex(dim=" + std::to_string(a.dim) + ")>";
+        });
+
         return m.ptr();
 }

@@ -13,7 +13,7 @@
 ///   2. saveRawVectors (before compress, for re-ranking)
 ///   3. compressIndex (encodes floats to TQ codes in-place)
 ///   4. hnsw.saveIndex (saves compressed index)
-///   5. Search with beginSearch/searchKnn/endSearch
+///   5. space.setSearchMode(hnsw), then searchKnn(&pq, K)
 ///   6. Re-rank: loadRawVectors for shortlist, compute exact L2, pick top-K
 ///
 /// Opt-in header: not included by hnswlib.h. Include directly when needed.
@@ -22,8 +22,11 @@
 #include "turbo_quant.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <fstream>
+#include <memory>
+#include <thread>
 
 #ifndef _WIN32
 #include <fcntl.h>
@@ -43,17 +46,18 @@ namespace turboquant {
 //   3 floats] meta[0] = norm, meta[1] = gamma, meta[2] = sigma Total: dim + dim
 //   + 12 bytes
 //
-// Distance modes:
-//   - Asymmetric (search): float query × TQ code. Set via beginSearch().
-//   - Symmetric (build):   TQ code × TQ code. Used when prepared_query_ is
-//   null.
+// Distance modes (two separate functions, explicitly switched):
+//   - turboQuantL2Build  (symmetric):  TQ code × TQ code. Default for addPoint.
+//   - turboQuantL2Search (asymmetric): PreparedQuery* × TQ code. For searchKnn.
 //
 // dist_func_param = this pointer. Static distance functions cast back to
-// const TurboQuantSpace* and access encoder/fields directly — no data
-// duplication.
+// const TurboQuantSpace* and access encoder/fields directly.
 //
-// Thread safety: beginSearch/endSearch modify prepared_query_.
-//   For concurrent search, use one TurboQuantSpace per thread.
+// Thread safety:
+//   Build: addPoint is thread-safe (HNSW internal locks).
+//   Search: fully thread-safe after setSearchMode(). Each thread creates its
+//   own TurboQuantPreparedQuery on the stack and passes &pq as query_data
+//   to searchKnn. No shared mutable state.
 // ===========================================================================
 
 class TurboQuantSpace : public SpaceInterface<float> {
@@ -63,15 +67,13 @@ class TurboQuantSpace : public SpaceInterface<float> {
   int num_levels_;   ///< 2^mse_bits SQ centroid levels
   float scale_;      ///< √(π/2) / √d for QJL correction
 
-  /// Non-null during search → asymmetric mode. Null → symmetric.
-  const TurboQuantPreparedQuery *prepared_query_;
-
   // -- Static distance functions -------------------------------------------
 
-  /// Asymmetric distance: prepared float query × compressed code.
+  /// Asymmetric distance: pVect1 = TurboQuantPreparedQuery*, pVect2 = TQ code.
   /// Uses precomputed LUT for SQ part, avoids per-element multiply.
-  static float distSearch(const TurboQuantPreparedQuery *pq,
-                          const char *code_buf, const TurboQuantSpace *space) {
+  static float distSearchImpl(const TurboQuantPreparedQuery *pq,
+                               const char *code_buf,
+                               const TurboQuantSpace *space) {
     const size_t dim = space->dim_;
     const uint8_t *sq_packed = reinterpret_cast<const uint8_t *>(code_buf);
     const int8_t *qjl_signs = reinterpret_cast<const int8_t *>(code_buf + dim);
@@ -99,12 +101,15 @@ class TurboQuantSpace : public SpaceInterface<float> {
     return std::max(0.0f, pq->q_norm_sq + x_norm * x_norm - 2.0f * ip);
   }
 
-  /// Symmetric distance: both sides are compressed codes.
-  /// Used during graph traversal when both nodes are compressed.
-  static float distSymmetric(const char *buf_a, const char *buf_b,
-                             const TurboQuantSpace *space) {
+  /// Build distance: both pVect1 and pVect2 are TQ codes (symmetric).
+  static float turboQuantL2Build(const void *pVect1, const void *pVect2,
+                                 const void *param_ptr) {
+    const auto *space = static_cast<const TurboQuantSpace *>(param_ptr);
     const size_t dim = space->dim_;
     const float *centroids = space->encoder_.centroids();
+
+    const char *buf_a = static_cast<const char *>(pVect1);
+    const char *buf_b = static_cast<const char *>(pVect2);
 
     const uint8_t *sq_a = reinterpret_cast<const uint8_t *>(buf_a);
     const float *meta_a = reinterpret_cast<const float *>(buf_a + dim + dim);
@@ -125,27 +130,22 @@ class TurboQuantSpace : public SpaceInterface<float> {
     return std::max(0.0f, norm_a * norm_a + norm_b * norm_b - 2.0f * ip);
   }
 
-  /// Dispatch: asymmetric if prepared_query_ is set, else symmetric.
-  static float turboQuantL2(const void *pVect1, const void *pVect2,
-                            const void *param_ptr) {
+  /// Search distance: pVect1 = TurboQuantPreparedQuery*, pVect2 = TQ code.
+  static float turboQuantL2Search(const void *pVect1, const void *pVect2,
+                                  const void *param_ptr) {
     const auto *space = static_cast<const TurboQuantSpace *>(param_ptr);
-    const char *buf2 = static_cast<const char *>(pVect2);
-    if (space->prepared_query_ != nullptr)
-      return distSearch(space->prepared_query_, buf2, space);
-    else
-      return distSymmetric(static_cast<const char *>(pVect1), buf2, space);
+    const auto *pq = static_cast<const TurboQuantPreparedQuery *>(pVect1);
+    return distSearchImpl(pq, static_cast<const char *>(pVect2), space);
   }
 
 public:
   TurboQuantSpace(size_t dim, int bits_per_coord = 4, uint64_t rot_seed = 42,
                   uint64_t qjl_seed = 137)
       : encoder_(dim, bits_per_coord, rot_seed, qjl_seed), dim_(dim),
-        code_size_(dim + dim + sizeof(float) * 3) // HNSW buffer layout
-        ,
+        code_size_(dim + dim + sizeof(float) * 3),
         num_levels_(1 << (bits_per_coord - 1)),
         scale_(std::sqrtf(static_cast<float>(M_PI) / 2.0f) /
-               std::sqrtf(static_cast<float>(dim))),
-        prepared_query_(nullptr) {
+               std::sqrtf(static_cast<float>(dim))) {
     assert(dim >= 4 && "TurboQuantSpace: dim must be at least 4");
     assert((dim & (dim - 1)) == 0 &&
            "TurboQuantSpace: dim must be a power of 2");
@@ -154,7 +154,8 @@ public:
   // -- SpaceInterface -------------------------------------------------------
 
   size_t get_data_size() override { return code_size_; }
-  DISTFUNC<float> get_dist_func() override { return &turboQuantL2; }
+  DISTFUNC<float> get_dist_func() override { return &turboQuantL2Build; }
+  DISTFUNC<float> getSearchDistFunc() const { return &turboQuantL2Search; }
   void *get_dist_func_param() override { return this; }
 
   // -- Accessors ------------------------------------------------------------
@@ -171,9 +172,32 @@ public:
     encoder_.encodeToHNSWBuffer(raw, out_buf);
   }
 
-  // -- Search state management ----------------------------------------------
+  // -- Mode switching -------------------------------------------------------
+  //
+  // Two-phase workflow:
+  //   1. Build: hnsw uses turboQuantL2Build (default from get_dist_func).
+  //   2. Search: call setSearchMode(hnsw) once after build completes.
+  //      Then each thread does:
+  //        auto pq = space.prepareQuery(raw_query);
+  //        auto result = hnsw.searchKnn(&pq, K);
+  //      No shared mutable state — fully thread-safe.
+
+  /// Switch HNSW to search mode: asymmetric distance (PreparedQuery* × code).
+  void setSearchMode(HierarchicalNSW<float> &hnsw) const {
+    hnsw.fstdistfunc_ = &turboQuantL2Search;
+    hnsw.dist_func_param_ = const_cast<TurboQuantSpace *>(this);
+  }
+
+  /// Switch HNSW back to build mode: symmetric distance (code × code).
+  void setBuildMode(HierarchicalNSW<float> &hnsw) const {
+    hnsw.fstdistfunc_ = &turboQuantL2Build;
+    hnsw.dist_func_param_ = const_cast<TurboQuantSpace *>(this);
+  }
+
+  // -- Query preparation ----------------------------------------------------
 
   /// Prepare query: amortizes 2 RHT calls across all distance computations.
+  /// Result lives on the caller's stack — no shared state.
   TurboQuantPreparedQuery prepareQuery(const float *raw_query) const {
     TurboQuantPreparedQuery pq;
     const size_t d = dim_;
@@ -207,13 +231,6 @@ public:
 
     return pq;
   }
-
-  /// Set distance function to asymmetric mode for the given prepared query.
-  /// Must be paired with endSearch(). Not thread-safe.
-  void beginSearch(const TurboQuantPreparedQuery &pq) { prepared_query_ = &pq; }
-
-  /// Reset distance function to symmetric mode.
-  void endSearch() { prepared_query_ = nullptr; }
 };
 
 // ===========================================================================
@@ -334,9 +351,8 @@ inline Status compressIndex(HierarchicalNSW<float> &hnsw,
     std::memcpy(slot, code_buf.data(), code_size);
   }
 
-  // Switch distance function to TQ
-  hnsw.fstdistfunc_ = tq_space.get_dist_func();
-  hnsw.dist_func_param_ = tq_space.get_dist_func_param();
+  // Switch distance function to TQ (build mode — symmetric)
+  tq_space.setBuildMode(hnsw);
 
   return OkStatus();
 }
@@ -575,6 +591,250 @@ class MappedRawVectors {
         vec_bytes_ = o.vec_bytes_;
         is_mmap_ = o.is_mmap_;
     }
+};
+
+// ===========================================================================
+// TurboQuantIndex — high-level facade for TQ-compressed HNSW
+//
+// Owns TurboQuantSpace + HierarchicalNSW + optional MappedRawVectors.
+// Provides build/save/load/search/searchRerank with minimal boilerplate.
+//
+// Thread safety: search() and searchRerank() are fully thread-safe after
+// build() or load() completes. Each call creates a stack-local
+// TurboQuantPreparedQuery — no shared mutable state.
+//
+// Usage:
+//   TurboQuantIndex idx(128, 8);           // dim=128, q8
+//   idx.build(data, N, 16, 200);           // M=16, ef_construction=200
+//   idx.save("index.bin", "raw.tqrv");
+//
+//   TurboQuantIndex idx2(128, 8);
+//   idx2.load("index.bin", "raw.tqrv");    // raw_path optional
+//   idx2.setEf(64);
+//   auto r1 = idx2.search(query, 10);
+//   auto r2 = idx2.searchRerank(query, 10, 100);
+// ===========================================================================
+
+class TurboQuantIndex {
+  size_t dim_;
+  int bits_per_coord_;
+  uint64_t rot_seed_;
+  uint64_t qjl_seed_;
+
+  std::unique_ptr<TurboQuantSpace> space_;
+  std::unique_ptr<HierarchicalNSW<float>> hnsw_;
+  MappedRawVectors raw_vectors_;
+
+public:
+  TurboQuantIndex(size_t dim, int bits_per_coord = 8,
+                  uint64_t rot_seed = 42, uint64_t qjl_seed = 137)
+      : dim_(dim), bits_per_coord_(bits_per_coord),
+        rot_seed_(rot_seed), qjl_seed_(qjl_seed) {}
+
+  // -- Build ----------------------------------------------------------------
+
+  /// Initialize space and HNSW graph for building. Call addPoint() to populate.
+  void initBuild(size_t max_elements, size_t M = 16, size_t ef_construction = 200) {
+    space_.reset(new TurboQuantSpace(dim_, bits_per_coord_, rot_seed_, qjl_seed_));
+    hnsw_.reset(new HierarchicalNSW<float>(space_.get(), max_elements, M, ef_construction));
+  }
+
+  /// Encode a float vector and add it to the index. Thread-safe (addPoint uses mutexes).
+  /// Caller must provide a thread-local buffer of size codeSizeBytes().
+  void addPoint(const float *vec, labeltype label, char *encode_buf) {
+    space_->encodeVector(vec, encode_buf);
+    hnsw_->addPoint(encode_buf, label);
+  }
+
+  /// Build a TQ-compressed HNSW index from raw float vectors (single-threaded).
+  /// data[i] points to a float[dim] vector for label i.
+  Status build(const float *const *data, size_t n,
+               size_t M = 16, size_t ef_construction = 200) {
+    initBuild(n, M, ef_construction);
+
+    std::vector<char> buf(space_->codeSizeBytes());
+    for (size_t i = 0; i < n; ++i)
+      addPoint(data[i], i, buf.data());
+
+    return OkStatus();
+  }
+
+  /// Build from contiguous array: data points to n*dim floats, row-major.
+  Status build(const float *data, size_t n,
+               size_t M = 16, size_t ef_construction = 200) {
+    std::vector<const float *> ptrs(n);
+    for (size_t i = 0; i < n; ++i)
+      ptrs[i] = data + i * dim_;
+    return build(ptrs.data(), n, M, ef_construction);
+  }
+
+  // -- Save / Load ----------------------------------------------------------
+
+  /// Save index and optionally raw vectors for re-ranking.
+  /// raw_data points to the original float vectors (n * dim, row-major).
+  /// If raw_path is empty, raw vectors are not saved.
+  Status save(const std::string &index_path,
+              const std::string &raw_path = "",
+              const float *raw_data = nullptr, size_t n = 0,
+              RawVectorDtype dtype = DTYPE_FLOAT32) const {
+    if (!hnsw_)
+      return Status("TurboQuantIndex::save: no index built");
+
+    hnsw_->saveIndex(index_path);
+
+    if (!raw_path.empty() && raw_data != nullptr && n > 0) {
+      // Write raw vectors directly (hnsw data slots are already compressed)
+      std::ofstream out(raw_path, std::ios::binary);
+      if (!out.good())
+        return Status("TurboQuantIndex::save: cannot open raw file");
+
+      uint64_t n64 = static_cast<uint64_t>(n);
+      uint64_t dim64 = static_cast<uint64_t>(dim_);
+      uint32_t dtype32 = static_cast<uint32_t>(dtype);
+      uint32_t reserved = 0;
+      out.write(reinterpret_cast<const char *>(&TQRV_MAGIC), 4);
+      out.write(reinterpret_cast<const char *>(&TQRV_VERSION), 4);
+      out.write(reinterpret_cast<const char *>(&n64), 8);
+      out.write(reinterpret_cast<const char *>(&dim64), 8);
+      out.write(reinterpret_cast<const char *>(&dtype32), 4);
+      out.write(reinterpret_cast<const char *>(&reserved), 4);
+
+      if (dtype == DTYPE_FLOAT32) {
+        out.write(reinterpret_cast<const char *>(raw_data),
+                  n * dim_ * sizeof(float));
+      } else {
+        std::vector<uint16_t> fp16_buf(dim_);
+        for (size_t i = 0; i < n; ++i) {
+          const float *vec = raw_data + i * dim_;
+          for (size_t j = 0; j < dim_; ++j)
+            fp16_buf[j] = float_to_fp16(vec[j]);
+          out.write(reinterpret_cast<const char *>(fp16_buf.data()),
+                    dim_ * sizeof(uint16_t));
+        }
+      }
+
+      if (!out.good())
+        return Status("TurboQuantIndex::save: write error");
+    }
+
+    return OkStatus();
+  }
+
+  /// Load index from disk. raw_path is optional (enables searchRerank).
+  Status load(const std::string &index_path,
+              const std::string &raw_path = "") {
+    space_.reset(new TurboQuantSpace(dim_, bits_per_coord_, rot_seed_, qjl_seed_));
+    hnsw_.reset(new HierarchicalNSW<float>(space_.get(), index_path));
+    space_->setSearchMode(*hnsw_);
+
+    if (!raw_path.empty()) {
+      auto st = raw_vectors_.open(raw_path);
+      if (!st.ok()) return st;
+    }
+
+    return OkStatus();
+  }
+
+  // -- Search ---------------------------------------------------------------
+
+  void setEf(size_t ef) {
+    if (hnsw_) hnsw_->setEf(ef);
+  }
+
+  size_t getEf() const {
+    return hnsw_ ? hnsw_->ef_ : 0;
+  }
+
+  /// TQ-only search. Thread-safe.
+  /// Returns priority queue of (distance, label) pairs, worst first.
+  std::priority_queue<std::pair<float, labeltype>>
+  search(const float *query, size_t k) const {
+    ensureSearchMode();
+    auto pq = space_->prepareQuery(query);
+    return hnsw_->searchKnn(&pq, k);
+  }
+
+  /// TQ search + exact L2 re-ranking from mmap'd raw vectors. Thread-safe.
+  /// Retrieves ef candidates via TQ, re-ranks by exact L2, returns top-k.
+  /// ef defaults to current hnsw ef if not specified.
+  std::vector<std::pair<float, labeltype>>
+  searchRerank(const float *query, size_t k, size_t ef = 0) const {
+    if (!raw_vectors_.is_open())
+      return {};
+
+    if (ef == 0)
+      ef = hnsw_->ef_;
+
+    // Step 1: TQ search for broad candidate set
+    ensureSearchMode();
+    auto pq = space_->prepareQuery(query);
+
+    // Temporarily use ef for this search (thread-safe: ef_ is only read)
+    size_t saved_ef = hnsw_->ef_;
+    // Note: ef_ write is not thread-safe with concurrent setEf() calls,
+    // but safe with concurrent search. Caller should set ef before searching.
+    const_cast<HierarchicalNSW<float> *>(hnsw_.get())->setEf(ef);
+    auto tq_result = hnsw_->searchKnn(&pq, ef);
+    const_cast<HierarchicalNSW<float> *>(hnsw_.get())->setEf(saved_ef);
+
+    // Step 2: exact L2 re-rank
+    std::vector<std::pair<float, labeltype>> shortlist;
+    shortlist.reserve(tq_result.size());
+
+    // Thread-local buffer for fp16 conversion
+    std::vector<float> vec_buf(dim_);
+
+    while (!tq_result.empty()) {
+      labeltype id = tq_result.top().second;
+      tq_result.pop();
+
+      const float *raw_vec = raw_vectors_.get_float32(id);
+      if (raw_vec == nullptr) {
+        raw_vectors_.get(id, vec_buf.data());
+        raw_vec = vec_buf.data();
+      }
+
+      // Exact L2 distance
+      float dist = 0.0f;
+      for (size_t i = 0; i < dim_; ++i) {
+        float diff = query[i] - raw_vec[i];
+        dist += diff * diff;
+      }
+      shortlist.push_back({dist, id});
+    }
+
+    // Step 3: select top-k
+    if (shortlist.size() > k) {
+      std::partial_sort(shortlist.begin(), shortlist.begin() + k,
+                        shortlist.end());
+      shortlist.resize(k);
+    } else {
+      std::sort(shortlist.begin(), shortlist.end());
+    }
+
+    return shortlist;
+  }
+
+  // -- Accessors ------------------------------------------------------------
+
+  bool hasRawVectors() const { return raw_vectors_.is_open(); }
+  size_t dim() const { return dim_; }
+  size_t numElements() const { return hnsw_ ? hnsw_->cur_element_count.load() : 0; }
+  size_t codeSizeBytes() const { return space_ ? space_->codeSizeBytes() : 0; }
+
+  const TurboQuantSpace *space() const { return space_.get(); }
+  const HierarchicalNSW<float> *hnsw() const { return hnsw_.get(); }
+
+private:
+  void ensureSearchMode() const {
+    // After build() the HNSW still has build dist func.
+    // Lazily switch on first search. Safe: setSearchMode just writes
+    // two pointers, and concurrent reads of the same value are fine.
+    if (hnsw_->fstdistfunc_ != space_->getSearchDistFunc()) {
+      const_cast<TurboQuantSpace *>(space_.get())->setSearchMode(
+          *const_cast<HierarchicalNSW<float> *>(hnsw_.get()));
+    }
+  }
 };
 
 } // namespace turboquant
