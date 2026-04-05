@@ -755,27 +755,25 @@ public:
   }
 
   /// TQ search + exact L2 re-ranking from mmap'd raw vectors. Thread-safe.
-  /// Retrieves ef candidates via TQ, re-ranks by exact L2, returns top-k.
-  /// ef defaults to current hnsw ef if not specified.
+  /// Retrieves rerank_ef candidates via TQ, re-ranks by exact L2, returns top-k.
+  /// rerank_ef controls the number of TQ candidates to re-rank.
+  /// Set hnsw ef >= rerank_ef before calling (via setEf).
+  /// Default rerank_ef = 0 means use current ef (i.e. re-rank all candidates
+  /// that searchKnn returns).
   std::vector<std::pair<float, labeltype>>
-  searchRerank(const float *query, size_t k, size_t ef = 0) const {
+  searchRerank(const float *query, size_t k, size_t rerank_ef = 0) const {
     if (!raw_vectors_.is_open())
       return {};
 
-    if (ef == 0)
-      ef = hnsw_->ef_;
+    if (rerank_ef == 0)
+      rerank_ef = hnsw_->ef_;
 
     // Step 1: TQ search for broad candidate set
+    // searchKnn uses max(ef_, rerank_ef) internally, so ef_ >= rerank_ef
+    // is recommended for best performance (avoids redundant graph traversal).
     ensureSearchMode();
     auto pq = space_->prepareQuery(query);
-
-    // Temporarily use ef for this search (thread-safe: ef_ is only read)
-    size_t saved_ef = hnsw_->ef_;
-    // Note: ef_ write is not thread-safe with concurrent setEf() calls,
-    // but safe with concurrent search. Caller should set ef before searching.
-    const_cast<HierarchicalNSW<float> *>(hnsw_.get())->setEf(ef);
-    auto tq_result = hnsw_->searchKnn(&pq, ef);
-    const_cast<HierarchicalNSW<float> *>(hnsw_.get())->setEf(saved_ef);
+    auto tq_result = hnsw_->searchKnn(&pq, rerank_ef);
 
     // Step 2: exact L2 re-rank
     std::vector<std::pair<float, labeltype>> shortlist;

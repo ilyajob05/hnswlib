@@ -1,94 +1,120 @@
 import os
+import time
 import hnswlib
 import numpy as np
 
 """
-TurboQuant example: build, search, save/load, and rerank with mmap'd raw vectors.
+TurboQuant example: build, search, save/load, rerank, and performance benchmark.
 
 TurboQuant compresses each vector from dim*4 bytes (float32) to 2*dim+12 bytes,
 reducing memory ~1.9x for dim=128.  Re-ranking with exact L2 on mmap'd original
 vectors restores recall to near-baseline levels.
+
+Key parameters:
+  - ef: controls search quality for both TQ and L2 (higher = better recall, slower)
+  - rerank_ef: number of TQ candidates to re-rank with exact L2 distances.
+    Should be >= ef. Good starting point: 2x-5x of k.
+    Default (0) = use current ef value.
 """
 
-dim = 512
-num_elements = 100000
-num_queries = 200
-k = 10
+dim = 128
+num_elements = 1000000
+num_queries = 1000
+k = 100
+ef = 200            # same ef for fair comparison between L2 and TQ
+rerank_ef = 200     # candidates to re-rank (>= ef for best results)
+M = 16
+ef_construction = 200
+num_threads = 8
 
-# Generate random data
 np.random.seed(42)
 data = np.float32(np.random.randn(num_elements, dim))
 queries = np.float32(np.random.randn(num_queries, dim))
 
-# --- Build TQ index --------------------------------------------------------
-print(f"Building TQ index: {num_elements} vectors, dim={dim}")
-tq = hnswlib.TQIndex(dim=dim, bits_per_coord=8)
-tq.build(data, M=16, ef_construction=200, num_threads=8)
-
-print(f"  element_count = {tq.element_count}")
-print(f"  code_size     = {tq.code_size} bytes/vector "
-      f"(vs {dim * 4} bytes for float32, "
-      f"{dim * 4 / tq.code_size:.1f}x compression)")
-
-# --- TQ search (compressed distances) --------------------------------------
-tq.ef = 64
-labels, distances = tq.knn_query(queries, k=k, num_threads=8)
-
-# Measure recall against brute-force
+# --- Ground truth (brute-force) --------------------------------------------
+print("Computing ground truth (brute-force)...")
 bf = hnswlib.BFIndex(space='l2', dim=dim)
 bf.init_index(max_elements=num_elements)
 bf.add_items(data)
-gt_labels, _ = bf.knn_query(queries, k=k, num_threads=8)
+gt_labels, _ = bf.knn_query(queries, k=k, num_threads=num_threads)
+del bf
 
-recall_tq = np.mean([
-    len(set(labels[i]) & set(gt_labels[i])) / k
-    for i in range(num_queries)
-])
-print(f"\nTQ search recall@{k}: {recall_tq:.4f}")
+def recall(labels):
+    return np.mean([
+        len(set(labels[i]) & set(gt_labels[i])) / k
+        for i in range(num_queries)
+    ])
 
-# --- Save index + raw vectors for rerank -----------------------------------
+# --- L2 baseline -----------------------------------------------------------
+print(f"\n--- L2 baseline (ef={ef}) ---")
+t0 = time.time()
+hnsw = hnswlib.Index(space='l2', dim=dim)
+hnsw.init_index(max_elements=num_elements, M=M, ef_construction=ef_construction)
+hnsw.add_items(data, num_threads=num_threads)
+build_l2 = time.time() - t0
+print(f"  Build: {build_l2:.2f}s")
+
+hnsw.set_ef(ef)
+t0 = time.time()
+labels_l2, _ = hnsw.knn_query(queries, k=k, num_threads=num_threads)
+search_l2 = time.time() - t0
+recall_l2 = recall(labels_l2)
+qps_l2 = num_queries / search_l2
+print(f"  Search: {search_l2 * 1000:.1f}ms ({qps_l2:.0f} QPS), recall@{k}={recall_l2:.4f}")
+del hnsw
+
+# --- TQ build --------------------------------------------------------------
+print(f"\n--- TQ8 (ef={ef}) ---")
+t0 = time.time()
+tq = hnswlib.TQIndex(dim=dim, bits_per_coord=8)
+tq.build(data, M=M, ef_construction=ef_construction, num_threads=num_threads)
+build_tq = time.time() - t0
+print(f"  Build: {build_tq:.2f}s")
+print(f"  Code size: {tq.code_size} B/vec (vs {dim * 4} B, "
+      f"{dim * 4 / tq.code_size:.1f}x compression)")
+
+# --- TQ search (no rerank) ------------------------------------------------
+tq.ef = ef
+t0 = time.time()
+labels_tq, _ = tq.knn_query(queries, k=k, num_threads=num_threads)
+search_tq = time.time() - t0
+recall_tq = recall(labels_tq)
+qps_tq = num_queries / search_tq
+print(f"  Search: {search_tq * 1000:.1f}ms ({qps_tq:.0f} QPS), recall@{k}={recall_tq:.4f}")
+
+# --- Save + Load with raw vectors -----------------------------------------
 index_path = "tq_example.bin"
 raw_path = "tq_example.tqrv"
-
-print(f"\nSaving index to '{index_path}', raw vectors to '{raw_path}'")
 tq.save(index_path, raw_path=raw_path, raw_data=data)
 del tq
 
-# --- Load and rerank -------------------------------------------------------
-print(f"Loading index from '{index_path}' with raw vectors")
-tq2 = hnswlib.TQIndex(dim=dim, bits_per_coord=8)
-tq2.load(index_path, raw_path=raw_path)
+tq = hnswlib.TQIndex(dim=dim, bits_per_coord=8)
+tq.load(index_path, raw_path=raw_path)
 
-print(f"  has_raw_vectors = {tq2.has_raw_vectors}")
+# --- TQ + rerank -----------------------------------------------------------
+# ef controls TQ graph traversal, rerank_ef controls how many candidates
+# are re-ranked with exact L2. Set ef >= rerank_ef for efficiency.
+print(f"\n--- TQ8 + rerank (ef={ef}, rerank_ef={rerank_ef}) ---")
+tq.ef = ef
+t0 = time.time()
+labels_rr, _ = tq.knn_query_rerank(queries, k=k, rerank_ef=rerank_ef, num_threads=num_threads)
+search_rr = time.time() - t0
+recall_rr = recall(labels_rr)
+qps_rr = num_queries / search_rr
+print(f"  Search: {search_rr * 1000:.1f}ms ({qps_rr:.0f} QPS), recall@{k}={recall_rr:.4f}")
 
-# Search with rerank: TQ search with ef=100, then exact L2 rerank to top-k
-labels_rr, distances_rr = tq2.knn_query_rerank(queries, k=k, ef=100, num_threads=8)
-
-recall_rr = np.mean([
-    len(set(labels_rr[i]) & set(gt_labels[i])) / k
-    for i in range(num_queries)
-])
-print(f"TQ + rerank recall@{k}: {recall_rr:.4f}")
-
-# --- L2 baseline for comparison --------------------------------------------
-hnsw = hnswlib.Index(space='l2', dim=dim)
-hnsw.init_index(max_elements=num_elements, M=16, ef_construction=200)
-hnsw.add_items(data)
-hnsw.set_ef(64)
-labels_l2, _ = hnsw.knn_query(queries, k=k, num_threads=8)
-
-recall_l2 = np.mean([
-    len(set(labels_l2[i]) & set(gt_labels[i])) / k
-    for i in range(num_queries)
-])
-print(f"L2 baseline recall@{k}: {recall_l2:.4f}")
-
-# --- Summary ----------------------------------------------------------------
-print(f"\n=== Summary (recall@{k}) ===")
-print(f"  L2 baseline (ef=64):       {recall_l2:.4f}")
-print(f"  TQ8 compressed (ef=64):    {recall_tq:.4f}")
-print(f"  TQ8 + rerank (ef=100):     {recall_rr:.4f}")
+# --- Summary ---------------------------------------------------------------
+print(f"\n{'='*55}")
+print(f"{'Method':<30} {'recall@'+str(k):<12} {'QPS':<10} {'Build'}")
+print(f"{'-'*55}")
+print(f"{'L2 (ef='+str(ef)+')':<30} {recall_l2:<12.4f} {qps_l2:<10.0f} {build_l2:.2f}s")
+print(f"{'TQ8 (ef='+str(ef)+')':<30} {recall_tq:<12.4f} {qps_tq:<10.0f} {build_tq:.2f}s")
+print(f"{'TQ8+rerank (rerank_ef='+str(rerank_ef)+')':<30} {recall_rr:<12.4f} {qps_rr:<10.0f} {build_tq:.2f}s")
+print(f"{'='*55}")
+print(f"\nMemory: {tq.code_size} B/vec TQ vs {dim*4} B/vec L2 "
+      f"({dim*4/tq.code_size:.1f}x compression)")
 
 # Cleanup
-os.remove(index_path)
-os.remove(raw_path)
+del tq
+# os.remove(index_path)
+# os.remove(raw_path)

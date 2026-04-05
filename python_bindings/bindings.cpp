@@ -1059,7 +1059,7 @@ class TQIndex {
                 data_numpy_d, free_when_done_d));
     }
 
-    py::object knn_query_rerank(py::object input, size_t k = 1, size_t ef = 0, int num_threads = -1) {
+    py::object knn_query_rerank(py::object input, size_t k = 1, size_t rerank_ef = 0, int num_threads = -1) {
         py::array_t<float, py::array::c_style | py::array::forcecast> items(input);
         auto buffer = items.request();
         size_t rows, features;
@@ -1080,7 +1080,7 @@ class TQIndex {
             data_numpy_d = new float[rows * k];
 
             ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
-                auto result = tq_index.searchRerank(items.data(row), k, ef);
+                auto result = tq_index.searchRerank(items.data(row), k, rerank_ef);
                 if (result.size() != k)
                     HNSWLIB_THROW_RUNTIME_ERROR(
                         "Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
@@ -1242,7 +1242,7 @@ PYBIND11_PLUGIN(hnswlib) {
             &TQIndex::knn_query_rerank,
             py::arg("data"),
             py::arg("k") = 1,
-            py::arg("ef") = 0,
+            py::arg("rerank_ef") = 0,
             py::arg("num_threads") = -1)
         .def("set_ef", &TQIndex::set_ef, py::arg("ef"))
         .def("get_current_count", &TQIndex::get_current_count)
