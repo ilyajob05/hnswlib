@@ -26,6 +26,51 @@
 namespace hnswlib {
 namespace turboquant {
 
+// ===========================================================================
+// Section 0: IEEE 754 float16 ↔ float32 conversion
+//
+// Portable bit-manipulation, no hardware fp16 dependency.
+// Used for compact raw-vector storage (.tqrv dtype=1).
+// ===========================================================================
+
+inline uint16_t float_to_fp16(float val) {
+    uint32_t bits;
+    std::memcpy(&bits, &val, 4);
+    uint32_t sign = (bits >> 16) & 0x8000;
+    int32_t exp = static_cast<int32_t>((bits >> 23) & 0xFF) - 127 + 15;
+    uint32_t frac = bits & 0x7FFFFF;
+
+    if (exp <= 0) {
+        // Underflow → zero (denormals omitted for simplicity)
+        return static_cast<uint16_t>(sign);
+    }
+    if (exp >= 31) {
+        // Overflow → infinity, preserve NaN
+        return static_cast<uint16_t>(sign | 0x7C00 | ((frac != 0) ? 0x0200 : 0));
+    }
+    return static_cast<uint16_t>(sign | (exp << 10) | (frac >> 13));
+}
+
+inline float fp16_to_float(uint16_t h) {
+    uint32_t sign = (static_cast<uint32_t>(h) & 0x8000) << 16;
+    uint32_t exp = (h >> 10) & 0x1F;
+    uint32_t frac = h & 0x03FF;
+
+    uint32_t bits;
+    if (exp == 0) {
+        // Zero or denormal → flush to signed zero
+        bits = sign;
+    } else if (exp == 31) {
+        // Inf / NaN
+        bits = sign | 0x7F800000 | (frac << 13);
+    } else {
+        bits = sign | ((exp - 15 + 127) << 23) | (frac << 13);
+    }
+    float result;
+    std::memcpy(&result, &bits, 4);
+    return result;
+}
+
 class RndGen64 {
   uint64_t state_;
 

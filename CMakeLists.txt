@@ -26,6 +26,7 @@ set(EXAMPLE_NAMES
     example_replace_deleted
     example_search
     example_turbo_quant
+    example_turbo_quant_mmap
     )
 
 set(TEST_NAMES

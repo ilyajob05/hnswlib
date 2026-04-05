@@ -25,6 +25,13 @@
 #include <cstring>
 #include <fstream>
 
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 namespace hnswlib {
 namespace turboquant {
 
@@ -213,22 +220,34 @@ public:
 // Compress/Save/Load utilities
 // ===========================================================================
 
-/// Raw vectors file magic and header size.
-static const uint32_t TQRV_MAGIC = 0x54515256; // "TQRV"
-static const uint32_t TQRV_VERSION = 1;
-static const uint64_t TQRV_DATA_OFFSET = 32;
+// ---------------------------------------------------------------------------
+// Raw vector file format (.tqrv) — version 2
+//
+// Header (32 bytes, fixed):
+//   [magic: u32 = "TQRV"] [version: u32 = 2]
+//   [num_vectors: u64] [dim: u64]
+//   [dtype: u32] [reserved: u32]
+//
+// Data (starting at offset 32):
+//   N * dim * element_size bytes, contiguous by internal ID.
+//
+// dtype: 0 = float32 (4 bytes), 1 = float16 (2 bytes).
+// Vector i is at offset: 32 + i * dim * element_size.
+// ---------------------------------------------------------------------------
 
-/// Save raw float vectors from an L2-built HNSW index to a flat file.
+static const uint32_t TQRV_MAGIC   = 0x54515256;  // "TQRV"
+static const uint32_t TQRV_VERSION = 2;
+
+enum RawVectorDtype : uint32_t {
+    DTYPE_FLOAT32 = 0,
+    DTYPE_FLOAT16 = 1,
+};
+
+/// Save raw float32 vectors from an L2-built HNSW index to a flat file.
 /// Must be called BEFORE compressIndex (while data slots still contain floats).
-///
-/// File format (.tqrv):
-///   [magic: u32] [version: u32] [num_vectors: u64] [dim: u64]
-///   [data_offset: u64 = 32] [pad: 4 bytes]
-///   [vectors: N * dim * sizeof(float), contiguous by internal ID]
-///
-/// Vector i is at file offset: data_offset + i * dim * sizeof(float).
 inline Status saveRawVectors(const std::string &path,
-                             const HierarchicalNSW<float> &hnsw, size_t dim) {
+                             const HierarchicalNSW<float> &hnsw, size_t dim,
+                             RawVectorDtype dtype = DTYPE_FLOAT32) {
 
   std::ofstream out(path, std::ios::binary);
   if (!out.good())
@@ -237,18 +256,35 @@ inline Status saveRawVectors(const std::string &path,
   size_t n = hnsw.cur_element_count.load();
 
   // Header (32 bytes)
-  out.write(reinterpret_cast<const char *>(&TQRV_MAGIC), 4);
-  out.write(reinterpret_cast<const char *>(&TQRV_VERSION), 4);
   uint64_t n64 = static_cast<uint64_t>(n);
   uint64_t dim64 = static_cast<uint64_t>(dim);
+  uint32_t dtype32 = static_cast<uint32_t>(dtype);
+  uint32_t reserved = 0;
+  out.write(reinterpret_cast<const char *>(&TQRV_MAGIC), 4);
+  out.write(reinterpret_cast<const char *>(&TQRV_VERSION), 4);
   out.write(reinterpret_cast<const char *>(&n64), 8);
   out.write(reinterpret_cast<const char *>(&dim64), 8);
-  out.write(reinterpret_cast<const char *>(&TQRV_DATA_OFFSET), 8);
+  out.write(reinterpret_cast<const char *>(&dtype32), 4);
+  out.write(reinterpret_cast<const char *>(&reserved), 4);
 
-  // Vectors (N * dim * 4 bytes)
-  for (size_t i = 0; i < n; ++i) {
-    const char *data = hnsw.getDataByInternalId(static_cast<tableint>(i));
-    out.write(data, dim * sizeof(float));
+  const size_t vec_bytes = dim * sizeof(float);
+
+  if (dtype == DTYPE_FLOAT32) {
+    for (size_t i = 0; i < n; ++i) {
+      const char *data = hnsw.getDataByInternalId(static_cast<tableint>(i));
+      out.write(data, vec_bytes);
+    }
+  } else {
+    // float16: convert each vector on the fly
+    std::vector<uint16_t> fp16_buf(dim);
+    for (size_t i = 0; i < n; ++i) {
+      const float *data = reinterpret_cast<const float *>(
+          hnsw.getDataByInternalId(static_cast<tableint>(i)));
+      for (size_t j = 0; j < dim; ++j)
+        fp16_buf[j] = float_to_fp16(data[j]);
+      out.write(reinterpret_cast<const char *>(fp16_buf.data()),
+                dim * sizeof(uint16_t));
+    }
   }
 
   if (!out.good())
@@ -305,15 +341,9 @@ inline Status compressIndex(HierarchicalNSW<float> &hnsw,
   return OkStatus();
 }
 
-/// Load specific raw vectors by internal ID from a .tqrv file.
-/// Does NOT load the entire file — seeks to each requested vector.
-///
-/// Parameters:
-///   path     — path to .tqrv file (created by saveRawVectors)
-///   ids      — array of internal IDs to load
-///   num_ids  — number of IDs
-///   dim      — vector dimension (must match file)
-///   out      — pre-allocated buffer for num_ids * dim floats
+/// Load specific raw vectors by internal ID from a .tqrv file (v1 or v2).
+/// Seeks to each requested vector — does not load the entire file.
+/// Output is always float32 (fp16 data is converted on read).
 inline Status loadRawVectors(const std::string &path, const size_t *ids,
                              size_t num_ids, size_t dim, float *out) {
 
@@ -321,23 +351,39 @@ inline Status loadRawVectors(const std::string &path, const size_t *ids,
   if (!in.good())
     return Status("loadRawVectors: cannot open file");
 
-  // Read and validate header
   uint32_t magic, version;
-  uint64_t n64, dim64, data_offset;
+  uint64_t n64, dim64;
   in.read(reinterpret_cast<char *>(&magic), 4);
   in.read(reinterpret_cast<char *>(&version), 4);
   in.read(reinterpret_cast<char *>(&n64), 8);
   in.read(reinterpret_cast<char *>(&dim64), 8);
-  in.read(reinterpret_cast<char *>(&data_offset), 8);
 
   if (magic != TQRV_MAGIC)
     return Status("loadRawVectors: invalid file magic");
-  if (version != TQRV_VERSION)
-    return Status("loadRawVectors: unsupported version");
   if (dim64 != static_cast<uint64_t>(dim))
     return Status("loadRawVectors: dimension mismatch");
 
-  size_t vec_bytes = dim * sizeof(float);
+  // Parse version-dependent fields
+  uint64_t data_offset = 32;
+  RawVectorDtype dtype = DTYPE_FLOAT32;
+  if (version == 1) {
+    uint64_t off_tmp;
+    in.read(reinterpret_cast<char *>(&off_tmp), 8);  // data_offset field
+    data_offset = off_tmp;
+  } else if (version == 2) {
+    uint32_t dtype32, reserved;
+    in.read(reinterpret_cast<char *>(&dtype32), 4);
+    in.read(reinterpret_cast<char *>(&reserved), 4);
+    dtype = static_cast<RawVectorDtype>(dtype32);
+  } else {
+    return Status("loadRawVectors: unsupported version");
+  }
+
+  const size_t elem_size = (dtype == DTYPE_FLOAT16) ? 2 : 4;
+  const size_t vec_bytes = dim * elem_size;
+  std::vector<uint16_t> fp16_buf;
+  if (dtype == DTYPE_FLOAT16)
+    fp16_buf.resize(dim);
 
   for (size_t i = 0; i < num_ids; ++i) {
     if (ids[i] >= n64)
@@ -346,7 +392,14 @@ inline Status loadRawVectors(const std::string &path, const size_t *ids,
     std::streamoff offset =
         static_cast<std::streamoff>(data_offset + ids[i] * vec_bytes);
     in.seekg(offset, std::ios::beg);
-    in.read(reinterpret_cast<char *>(out + i * dim), vec_bytes);
+
+    if (dtype == DTYPE_FLOAT32) {
+      in.read(reinterpret_cast<char *>(out + i * dim), vec_bytes);
+    } else {
+      in.read(reinterpret_cast<char *>(fp16_buf.data()), vec_bytes);
+      for (size_t j = 0; j < dim; ++j)
+        out[i * dim + j] = fp16_to_float(fp16_buf[j]);
+    }
 
     if (!in.good())
       return Status("loadRawVectors: read error");
@@ -354,6 +407,175 @@ inline Status loadRawVectors(const std::string &path, const size_t *ids,
 
   return OkStatus();
 }
+
+// ===========================================================================
+// MappedRawVectors — memory-mapped access to .tqrv files
+//
+// Maps the entire file read-only. get() returns a pointer into the mapped
+// region (zero-copy for float32) or converts fp16→fp32 into a caller buffer.
+// POSIX (Linux/macOS): mmap + madvise(MADV_RANDOM).
+// Windows: falls back to reading the entire file into malloc'd memory.
+// ===========================================================================
+
+class MappedRawVectors {
+    void *mapped_;          ///< mmap base (POSIX) or malloc'd block (Windows)
+    size_t file_size_;      ///< total mapped/allocated size
+    const char *data_;      ///< pointer to first vector byte
+    uint64_t num_vectors_;
+    uint64_t dim_;
+    RawVectorDtype dtype_;
+    size_t elem_size_;      ///< bytes per element: 4 (fp32) or 2 (fp16)
+    size_t vec_bytes_;      ///< dim_ * elem_size_
+    bool is_mmap_;          ///< true = mmap, false = malloc fallback
+
+ public:
+    MappedRawVectors()
+        : mapped_(nullptr), file_size_(0), data_(nullptr),
+          num_vectors_(0), dim_(0), dtype_(DTYPE_FLOAT32),
+          elem_size_(4), vec_bytes_(0), is_mmap_(false) {}
+
+    ~MappedRawVectors() { close(); }
+
+    // Non-copyable, movable
+    MappedRawVectors(const MappedRawVectors &) = delete;
+    MappedRawVectors &operator=(const MappedRawVectors &) = delete;
+    MappedRawVectors(MappedRawVectors &&o) noexcept { moveFrom(o); }
+    MappedRawVectors &operator=(MappedRawVectors &&o) noexcept {
+        if (this != &o) { close(); moveFrom(o); }
+        return *this;
+    }
+
+    /// Open and map a .tqrv file (v1 or v2).
+    Status open(const std::string &path) {
+        if (mapped_)
+            return Status("MappedRawVectors: already open");
+
+#ifndef _WIN32
+        // --- POSIX path: mmap ---
+        int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0)
+            return Status("MappedRawVectors: cannot open file");
+
+        struct stat st;
+        if (fstat(fd, &st) != 0) { ::close(fd); return Status("MappedRawVectors: fstat failed"); }
+        file_size_ = static_cast<size_t>(st.st_size);
+
+        mapped_ = mmap(nullptr, file_size_, PROT_READ, MAP_PRIVATE, fd, 0);
+        ::close(fd);
+        if (mapped_ == MAP_FAILED) { mapped_ = nullptr; return Status("MappedRawVectors: mmap failed"); }
+
+        madvise(mapped_, file_size_, MADV_RANDOM);
+        is_mmap_ = true;
+#else
+        // --- Windows fallback: read into memory ---
+        std::ifstream in(path, std::ios::binary | std::ios::ate);
+        if (!in.good())
+            return Status("MappedRawVectors: cannot open file");
+        file_size_ = static_cast<size_t>(in.tellg());
+        in.seekg(0);
+
+        mapped_ = std::malloc(file_size_);
+        if (!mapped_)
+            return Status("MappedRawVectors: malloc failed");
+        in.read(static_cast<char *>(mapped_), file_size_);
+        if (!in.good()) { std::free(mapped_); mapped_ = nullptr; return Status("MappedRawVectors: read failed"); }
+        is_mmap_ = false;
+#endif
+
+        return parseHeader();
+    }
+
+    void close() {
+        if (!mapped_) return;
+#ifndef _WIN32
+        if (is_mmap_)
+            munmap(mapped_, file_size_);
+        else
+            std::free(mapped_);
+#else
+        std::free(mapped_);
+#endif
+        mapped_ = nullptr;
+        data_ = nullptr;
+    }
+
+    // -- Accessors ----------------------------------------------------------
+
+    bool is_open() const { return mapped_ != nullptr; }
+    uint64_t num_vectors() const { return num_vectors_; }
+    uint64_t dim() const { return dim_; }
+    RawVectorDtype dtype() const { return dtype_; }
+
+    /// Zero-copy access for float32 files.  Returns nullptr for float16.
+    const float *get_float32(uint64_t label) const {
+        assert(label < num_vectors_ && "get_float32: label out of range");
+        if (dtype_ != DTYPE_FLOAT32) return nullptr;
+        return reinterpret_cast<const float *>(data_ + label * vec_bytes_);
+    }
+
+    /// Universal access: writes dim floats to buf.
+    /// For float32 — memcpy.  For float16 — converts to float32.
+    void get(uint64_t label, float *buf) const {
+        assert(label < num_vectors_ && "get: label out of range");
+        const char *src = data_ + label * vec_bytes_;
+        if (dtype_ == DTYPE_FLOAT32) {
+            std::memcpy(buf, src, vec_bytes_);
+        } else {
+            const uint16_t *fp16 = reinterpret_cast<const uint16_t *>(src);
+            for (uint64_t i = 0; i < dim_; ++i)
+                buf[i] = fp16_to_float(fp16[i]);
+        }
+    }
+
+ private:
+    Status parseHeader() {
+        if (file_size_ < 32) { close(); return Status("MappedRawVectors: file too small"); }
+
+        const char *hdr = static_cast<const char *>(mapped_);
+        uint32_t magic, version;
+        std::memcpy(&magic, hdr, 4);
+        std::memcpy(&version, hdr + 4, 4);
+
+        if (magic != TQRV_MAGIC) { close(); return Status("MappedRawVectors: invalid magic"); }
+
+        std::memcpy(&num_vectors_, hdr + 8, 8);
+        std::memcpy(&dim_, hdr + 16, 8);
+
+        uint64_t data_offset = 32;
+        if (version == 1) {
+            dtype_ = DTYPE_FLOAT32;
+            std::memcpy(&data_offset, hdr + 24, 8);
+        } else if (version == 2) {
+            uint32_t dtype32;
+            std::memcpy(&dtype32, hdr + 24, 4);
+            dtype_ = static_cast<RawVectorDtype>(dtype32);
+        } else {
+            close();
+            return Status("MappedRawVectors: unsupported version");
+        }
+
+        elem_size_ = (dtype_ == DTYPE_FLOAT16) ? 2 : 4;
+        vec_bytes_ = dim_ * elem_size_;
+        data_ = static_cast<const char *>(mapped_) + data_offset;
+
+        size_t expected = data_offset + num_vectors_ * vec_bytes_;
+        if (file_size_ < expected) { close(); return Status("MappedRawVectors: file truncated"); }
+
+        return OkStatus();
+    }
+
+    void moveFrom(MappedRawVectors &o) {
+        mapped_ = o.mapped_;       o.mapped_ = nullptr;
+        file_size_ = o.file_size_; o.file_size_ = 0;
+        data_ = o.data_;           o.data_ = nullptr;
+        num_vectors_ = o.num_vectors_; o.num_vectors_ = 0;
+        dim_ = o.dim_;             o.dim_ = 0;
+        dtype_ = o.dtype_;
+        elem_size_ = o.elem_size_;
+        vec_bytes_ = o.vec_bytes_;
+        is_mmap_ = o.is_mmap_;
+    }
+};
 
 } // namespace turboquant
 } // namespace hnswlib
