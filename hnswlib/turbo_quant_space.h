@@ -41,10 +41,11 @@ namespace turboquant {
 // ===========================================================================
 // TurboQuantSpace — SpaceInterface adapter for HNSW
 //
-// HNSW buffer layout (defined by encodeToHNSWBuffer):
-//   [sq_packed: dim bytes (uint8_t)] [qjl_signs: dim bytes (int8_t ±1)] [meta:
-//   3 floats] meta[0] = norm, meta[1] = gamma, meta[2] = sigma Total: dim + dim
-//   + 12 bytes
+// HNSW buffer layout (interleaved, defined by encodeToHNSWBuffer):
+//   [interleaved: dim bytes] [meta: 3 floats]
+//   byte[i] = (sq_idx << 1) | qjl_bit
+//   meta[0] = norm, meta[1] = gamma, meta[2] = sigma
+//   Total: dim + 12 bytes
 //
 // Distance modes (two separate functions, explicitly switched):
 //   - turboQuantL2Build  (symmetric):  TQ code × TQ code. Default for addPoint.
@@ -65,35 +66,30 @@ class TurboQuantSpace;
 
 // -- Function pointer types for SIMD dispatch --------------------------------
 typedef float (*TQDistSearchFunc)(const TurboQuantPreparedQuery *pq,
-                                   const char *code_buf,
-                                   const TurboQuantSpace *space);
+                                  const char *code_buf,
+                                  const TurboQuantSpace *space);
 
 // ===========================================================================
 // Scalar fallback implementations
 // ===========================================================================
 
-static float
-distSearchScalar(const TurboQuantPreparedQuery *pq,
-                 const char *code_buf,
-                 const TurboQuantSpace *space);
+static float distSearchScalar(const TurboQuantPreparedQuery *pq,
+                              const char *code_buf,
+                              const TurboQuantSpace *space);
 
-static float
-distBuildScalar(const void *pVect1, const void *pVect2,
-                const void *param_ptr);
+static float distBuildScalar(const void *pVect1, const void *pVect2,
+                             const void *param_ptr);
 
 // ===========================================================================
 // NEON implementations (ARM, 4 floats per iteration)
 // ===========================================================================
 #if defined(USE_NEON)
 
-static float
-distSearchNEON(const TurboQuantPreparedQuery *pq,
-               const char *code_buf,
-               const TurboQuantSpace *space);
+static float distSearchNEON(const TurboQuantPreparedQuery *pq,
+                            const char *code_buf, const TurboQuantSpace *space);
 
-static float
-distBuildNEON(const void *pVect1, const void *pVect2,
-              const void *param_ptr);
+static float distBuildNEON(const void *pVect1, const void *pVect2,
+                           const void *param_ptr);
 
 #endif // USE_NEON
 
@@ -102,14 +98,11 @@ distBuildNEON(const void *pVect1, const void *pVect2,
 // ===========================================================================
 #if defined(USE_SSE)
 
-static float
-distSearchSSE(const TurboQuantPreparedQuery *pq,
-              const char *code_buf,
-              const TurboQuantSpace *space);
+static float distSearchSSE(const TurboQuantPreparedQuery *pq,
+                           const char *code_buf, const TurboQuantSpace *space);
 
-static float
-distBuildSSE(const void *pVect1, const void *pVect2,
-             const void *param_ptr);
+static float distBuildSSE(const void *pVect1, const void *pVect2,
+                          const void *param_ptr);
 
 #endif // USE_SSE
 
@@ -118,26 +111,23 @@ distBuildSSE(const void *pVect1, const void *pVect2,
 // ===========================================================================
 #if defined(USE_AVX)
 
-static float
-distSearchAVX(const TurboQuantPreparedQuery *pq,
-              const char *code_buf,
-              const TurboQuantSpace *space);
+static float distSearchAVX(const TurboQuantPreparedQuery *pq,
+                           const char *code_buf, const TurboQuantSpace *space);
 
-static float
-distBuildAVX(const void *pVect1, const void *pVect2,
-             const void *param_ptr);
+static float distBuildAVX(const void *pVect1, const void *pVect2,
+                          const void *param_ptr);
 
 #endif // USE_AVX
 
 class TurboQuantSpace : public SpaceInterface<float> {
   TurboQuantEncoder encoder_;
   size_t dim_;
-  size_t code_size_; ///< HNSW buffer size: dim + dim + 12
+  size_t code_size_; ///< HNSW buffer size: dim + 12
   int num_levels_;   ///< 2^mse_bits SQ centroid levels
   float scale_;      ///< √(π/2) / √d for QJL correction
 
   TQDistSearchFunc dist_search_func_;
-  DISTFUNC<float>  dist_build_func_;
+  DISTFUNC<float> dist_build_func_;
 
   // -- Static HNSW wrappers ------------------------------------------------
 
@@ -146,7 +136,8 @@ class TurboQuantSpace : public SpaceInterface<float> {
                                   const void *param_ptr) {
     const auto *space = static_cast<const TurboQuantSpace *>(param_ptr);
     const auto *pq = static_cast<const TurboQuantPreparedQuery *>(pVect1);
-    return space->dist_search_func_(pq, static_cast<const char *>(pVect2), space);
+    return space->dist_search_func_(pq, static_cast<const char *>(pVect2),
+                                    space);
   }
 
   /// Build distance: both pVect1 and pVect2 are TQ codes (symmetric).
@@ -160,12 +151,11 @@ public:
   TurboQuantSpace(size_t dim, int bits_per_coord = 4, uint64_t rot_seed = 42,
                   uint64_t qjl_seed = 137)
       : encoder_(dim, bits_per_coord, rot_seed, qjl_seed), dim_(dim),
-        code_size_(dim + dim + sizeof(float) * 3),
+        code_size_(dim + sizeof(float) * 3),
         num_levels_(1 << (bits_per_coord - 1)),
         scale_(std::sqrtf(static_cast<float>(M_PI) / 2.0f) /
                std::sqrtf(static_cast<float>(dim))),
-        dist_search_func_(distSearchScalar),
-        dist_build_func_(distBuildScalar) {
+        dist_search_func_(distSearchScalar), dist_build_func_(distBuildScalar) {
     assert(dim >= 4 && "TurboQuantSpace: dim must be at least 4");
     assert((dim & (dim - 1)) == 0 &&
            "TurboQuantSpace: dim must be a power of 2");
@@ -261,6 +251,15 @@ public:
 // ===========================================================================
 // Distance function implementations (scalar + SIMD)
 //
+// HNSW buffer layout (interleaved):
+//   [packed: dim bytes] [meta: 3 floats (norm, gamma, sigma)]
+//   packed[i] = (sq_idx << 1) | qjl_bit
+//     sq_idx:  centroid index for Lloyd-Max SQ (upper 7 or 3 bits)
+//     qjl_bit: QJL correction sign (bit 0): 1 = positive, 0 = negative
+//
+// distSearch: PreparedQuery × code (asymmetric, used for search)
+// distBuild:  code × code (symmetric, SQ-only, used for graph construction)
+//
 // Defined after TurboQuantSpace so they can access its members.
 // Each variant has the same signature; the constructor selects one at runtime.
 // ===========================================================================
@@ -268,70 +267,70 @@ public:
 // -- helpers for reading dim/scale from TurboQuantSpace ---------------------
 // (avoid friend declarations; these are trivially inlineable)
 
-inline size_t tqsDim(const TurboQuantSpace *s) { return s->dim(); }
-inline float  tqsScale(const TurboQuantSpace *s) { return s->scale(); }
-inline const float *tqsCentroids(const TurboQuantSpace *s) {
-  return s->encoder().centroids();
-}
+// inline size_t tqsDim(const TurboQuantSpace *s) { return s->dim(); }
+// inline float tqsScale(const TurboQuantSpace *s) { return s->scale(); }
+// inline const float *tqsCentroids(const TurboQuantSpace *s) {
+  // return s->encoder().centroids();
+// }
 
 // ---------------------------------------------------------------------------
 // Scalar fallback
 // ---------------------------------------------------------------------------
 
-static float
-distSearchScalar(const TurboQuantPreparedQuery *pq,
-                 const char *code_buf,
-                 const TurboQuantSpace *space) {
-  const size_t dim = tqsDim(space);
-  const uint8_t *sq_packed = reinterpret_cast<const uint8_t *>(code_buf);
-  const int8_t *qjl_signs = reinterpret_cast<const int8_t *>(code_buf + dim);
-  const float *meta = reinterpret_cast<const float *>(code_buf + dim + dim);
+static float distSearchScalar(const TurboQuantPreparedQuery *pq,
+                              const char *code_buf,
+                              const TurboQuantSpace *space) {
+  const size_t dim = space->dim();
+  const uint8_t *packed = reinterpret_cast<const uint8_t *>(code_buf);
+  const float *meta = reinterpret_cast<const float *>(code_buf + dim);
   const float x_norm = meta[0];
   const float gamma = meta[1];
   const float sigma = meta[2];
 
-  // Term 1: SQ inner product via direct centroid gather
+  // Fused loop: extract sq_idx and qjl_bit from interleaved byte
+  // byte[i] = (sq_idx << 1) | qjl_bit; qjl_bit=1 → +1, qjl_bit=0 → -1
   float ip_mse = 0.0f;
+  float dot_qjl = 0.0f;
   const float *centroids = pq->centroids;
   const float *q_rot = pq->q_rot.data();
-  for (size_t i = 0; i < dim; ++i)
-    ip_mse += q_rot[i] * centroids[sq_packed[i]];
+  const float *s_q = pq->s_q.data();
+  for (size_t i = 0; i < dim; ++i) {
+    uint8_t byte = packed[i];
+    ip_mse += q_rot[i] * centroids[byte >> 1];
+    float sign = (byte & 1) ? 1.0f : -1.0f;
+    dot_qjl += s_q[i] * sign;
+  }
   ip_mse *= sigma;
-
-  // Term 2: QJL correction
-  float dot_qjl = 0.0f;
-  for (size_t i = 0; i < dim; ++i)
-    dot_qjl += pq->s_q[i] * qjl_signs[i];
-  const float correction = tqsScale(space) * gamma * dot_qjl;
+  const float correction = space->scale() * gamma * dot_qjl;
 
   // L2 = ||q||² + ||x||² - 2·IP
   const float ip = (ip_mse + correction) * x_norm * pq->q_norm;
   return std::max(0.0f, pq->q_norm_sq + x_norm * x_norm - 2.0f * ip);
 }
 
-static float
-distBuildScalar(const void *pVect1, const void *pVect2,
-                const void *param_ptr) {
+static float distBuildScalar(const void *pVect1, const void *pVect2,
+                             const void *param_ptr) {
   const auto *space = static_cast<const TurboQuantSpace *>(param_ptr);
-  const size_t dim = tqsDim(space);
-  const float *centroids = tqsCentroids(space);
+  const size_t dim = space->dim();
+  const float16_t *centroids = space->encoder().centroids();
 
   const char *buf_a = static_cast<const char *>(pVect1);
   const char *buf_b = static_cast<const char *>(pVect2);
 
-  const uint8_t *sq_a = reinterpret_cast<const uint8_t *>(buf_a);
-  const float *meta_a = reinterpret_cast<const float *>(buf_a + dim + dim);
+  const uint8_t *packed_a = reinterpret_cast<const uint8_t *>(buf_a);
+  const float *meta_a = reinterpret_cast<const float *>(buf_a + dim);
   const float norm_a = meta_a[0];
   const float sigma_a = meta_a[2];
 
-  const uint8_t *sq_b = reinterpret_cast<const uint8_t *>(buf_b);
-  const float *meta_b = reinterpret_cast<const float *>(buf_b + dim + dim);
+  const uint8_t *packed_b = reinterpret_cast<const uint8_t *>(buf_b);
+  const float *meta_b = reinterpret_cast<const float *>(buf_b + dim);
   const float norm_b = meta_b[0];
   const float sigma_b = meta_b[2];
 
   float ip_rot = 0.0f;
   for (size_t i = 0; i < dim; ++i)
-    ip_rot += (centroids[sq_a[i]] * sigma_a) * (centroids[sq_b[i]] * sigma_b);
+    ip_rot += (centroids[packed_a[i] >> 1] * sigma_a) *
+              (centroids[packed_b[i] >> 1] * sigma_b);
 
   const float ip = ip_rot * norm_a * norm_b;
   return std::max(0.0f, norm_a * norm_a + norm_b * norm_b - 2.0f * ip);
@@ -342,82 +341,81 @@ distBuildScalar(const void *pVect1, const void *pVect2,
 // ---------------------------------------------------------------------------
 #if defined(USE_NEON)
 
-static float
-distSearchNEON(const TurboQuantPreparedQuery *pq,
-               const char *code_buf,
-               const TurboQuantSpace *space) {
-  const size_t dim = tqsDim(space);
-  const uint8_t *sq_packed = reinterpret_cast<const uint8_t *>(code_buf);
-  const int8_t *qjl_signs = reinterpret_cast<const int8_t *>(code_buf + dim);
-  const float *meta = reinterpret_cast<const float *>(code_buf + dim + dim);
+static float distSearchNEON(const TurboQuantPreparedQuery *pq,
+                            const char *code_buf,
+                            const TurboQuantSpace *space) {
+  const size_t dim = space->dim();
+  const uint8_t *packed = reinterpret_cast<const uint8_t *>(code_buf);
+  const float *meta = reinterpret_cast<const float *>(code_buf + dim);
   const float x_norm = meta[0];
   const float gamma = meta[1];
   const float sigma = meta[2];
 
   const float *centroids = pq->centroids;
-  const float *q_rot = pq->q_rot.data();
-  const float *s_q = pq->s_q.data();
+  const float16_t *q_rot = pq->q_rot.data();
+  const float16_t *s_q = pq->s_q.data();
 
   // Sign-flip mask: XOR with this flips the sign bit of a float
-  const uint32x4_t sign_bit = vdupq_n_u32(0x80000000u);
+  const uint16x8_t sign_bit = vdupq_n_u16(0x8000u);
+  // Mask for extracting qjl_bit (bit 0)
+  const uint8x8_t one_u8 = vdup_n_u8(1);
 
-  float32x4_t sum_ip0 = vdupq_n_f32(0.0f);
-  float32x4_t sum_ip1 = vdupq_n_f32(0.0f);
-  float32x4_t sum_qjl0 = vdupq_n_f32(0.0f);
-  float32x4_t sum_qjl1 = vdupq_n_f32(0.0f);
+  float16x8_t sum_ip0 = vdupq_n_f16(0.0f);
+  float16x8_t sum_ip1 = vdupq_n_f16(0.0f);
+  float16x8_t sum_qjl0 = vdupq_n_f16(0.0f);
+  float16x8_t sum_qjl1 = vdupq_n_f16(0.0f);
 
-  // Fused loop: centroid gather + q_rot multiply + QJL, 8 elements at a time.
-  // Centroids table is small (≤512B for q8) — fits in L1 cache.
   size_t i = 0;
   for (; i + 8 <= dim; i += 8) {
-    // Centroid gather: scalar load from small table, then NEON multiply with q_rot
+    // Extract sq_idx = byte >> 1, gather centroids
     float c0[4], c1[4];
-    c0[0] = centroids[sq_packed[i]];
-    c0[1] = centroids[sq_packed[i+1]];
-    c0[2] = centroids[sq_packed[i+2]];
-    c0[3] = centroids[sq_packed[i+3]];
-    c1[0] = centroids[sq_packed[i+4]];
-    c1[1] = centroids[sq_packed[i+5]];
-    c1[2] = centroids[sq_packed[i+6]];
-    c1[3] = centroids[sq_packed[i+7]];
+    c0[0] = centroids[packed[i] >> 1];
+    c0[1] = centroids[packed[i + 1] >> 1];
+    c0[2] = centroids[packed[i + 2] >> 1];
+    c0[3] = centroids[packed[i + 3] >> 1];
+    c1[0] = centroids[packed[i + 4] >> 1];
+    c1[1] = centroids[packed[i + 5] >> 1];
+    c1[2] = centroids[packed[i + 6] >> 1];
+    c1[3] = centroids[packed[i + 7] >> 1];
     sum_ip0 = vmlaq_f32(sum_ip0, vld1q_f32(q_rot + i), vld1q_f32(c0));
     sum_ip1 = vmlaq_f32(sum_ip1, vld1q_f32(q_rot + i + 4), vld1q_f32(c1));
 
-    // QJL: load 8 int8 signs, expand to 2 × int32x4, sign-flip s_q
-    int8x8_t s8 = vld1_s8(qjl_signs + i);
-    int16x8_t s16 = vmovl_s8(s8);
-    int32x4_t s32_lo = vmovl_s16(vget_low_s16(s16));
-    int32x4_t s32_hi = vmovl_s16(vget_high_s16(s16));
-    uint32x4_t neg0 = vcltq_s32(s32_lo, vdupq_n_s32(0));
-    uint32x4_t neg1 = vcltq_s32(s32_hi, vdupq_n_s32(0));
+    // QJL: extract bit 0 → neg_mask → conditionally flip sign of s_q
+    //   bit=1 → positive (+1, keep s_q), bit=0 → negative (-1, flip s_q)
+    uint8x8_t bytes = vld1_u8(packed + i);
+    uint8x8_t bits = vand_u8(bytes, one_u8); // 0 or 1
+    int8x8_t signs = vsub_s8(vreinterpret_s8_u8(vadd_u8(bits, bits)),
+                             vdup_n_s8(1)); // 2*bit-1 → ±1
+    // Widen ±1 to int32 lanes, build neg_mask, XOR to flip sign of s_q
+    int16x8_t s16 = vmovl_s8(signs);
+    uint32x4_t neg0 = vcltq_s32(vmovl_s16(vget_low_s16(s16)), vdupq_n_s32(0));
+    uint32x4_t neg1 = vcltq_s32(vmovl_s16(vget_high_s16(s16)), vdupq_n_s32(0));
 
-    uint32x4_t sq0 = veorq_u32(vreinterpretq_u32_f32(vld1q_f32(s_q + i)),
-                                vandq_u32(neg0, sign_bit));
-    uint32x4_t sq1 = veorq_u32(vreinterpretq_u32_f32(vld1q_f32(s_q + i + 4)),
-                                vandq_u32(neg1, sign_bit));
-    sum_qjl0 = vaddq_f32(sum_qjl0, vreinterpretq_f32_u32(sq0));
-    sum_qjl1 = vaddq_f32(sum_qjl1, vreinterpretq_f32_u32(sq1));
+    sum_qjl0 =
+        vaddq_f32(sum_qjl0, vreinterpretq_f32_u32(veorq_u32(
+                                vreinterpretq_u32_f32(vld1q_f32(s_q + i)),
+                                vandq_u32(neg0, sign_bit))));
+    sum_qjl1 =
+        vaddq_f32(sum_qjl1, vreinterpretq_f32_u32(veorq_u32(
+                                vreinterpretq_u32_f32(vld1q_f32(s_q + i + 4)),
+                                vandq_u32(neg1, sign_bit))));
   }
 
-  // Handle remaining 4 elements (dim is power of 2 ≥ 4, so at most one group)
   for (; i + 4 <= dim; i += 4) {
     float cv[4];
-    cv[0] = centroids[sq_packed[i]];
-    cv[1] = centroids[sq_packed[i+1]];
-    cv[2] = centroids[sq_packed[i+2]];
-    cv[3] = centroids[sq_packed[i+3]];
+    cv[0] = centroids[packed[i] >> 1];
+    cv[1] = centroids[packed[i + 1] >> 1];
+    cv[2] = centroids[packed[i + 2] >> 1];
+    cv[3] = centroids[packed[i + 3] >> 1];
     sum_ip0 = vmlaq_f32(sum_ip0, vld1q_f32(q_rot + i), vld1q_f32(cv));
 
-    int8x8_t s8 = vld1_s8(qjl_signs + i);
-    int16x8_t s16 = vmovl_s8(s8);
-    int32x4_t s32 = vmovl_s16(vget_low_s16(s16));
-    uint32x4_t neg = vcltq_s32(s32, vdupq_n_s32(0));
-    uint32x4_t sq_v = veorq_u32(vreinterpretq_u32_f32(vld1q_f32(s_q + i)),
-                                 vandq_u32(neg, sign_bit));
-    sum_qjl0 = vaddq_f32(sum_qjl0, vreinterpretq_f32_u32(sq_v));
+    // Scalar QJL for remainder
+    float sq_arr[4];
+    for (int j = 0; j < 4; ++j)
+      sq_arr[j] = s_q[i + j] * ((packed[i + j] & 1) ? 1.0f : -1.0f);
+    sum_qjl0 = vaddq_f32(sum_qjl0, vld1q_f32(sq_arr));
   }
 
-  // Horizontal sum (merge two accumulators first, then reduce)
   float ip_mse = vaddvq_f32(vaddq_f32(sum_ip0, sum_ip1)) * sigma;
   float dot_qjl = vaddvq_f32(vaddq_f32(sum_qjl0, sum_qjl1));
 
@@ -426,9 +424,8 @@ distSearchNEON(const TurboQuantPreparedQuery *pq,
   return std::max(0.0f, pq->q_norm_sq + x_norm * x_norm - 2.0f * ip);
 }
 
-static float
-distBuildNEON(const void *pVect1, const void *pVect2,
-              const void *param_ptr) {
+static float distBuildNEON(const void *pVect1, const void *pVect2,
+                           const void *param_ptr) {
   const auto *space = static_cast<const TurboQuantSpace *>(param_ptr);
   const size_t dim = tqsDim(space);
   const float *centroids = tqsCentroids(space);
@@ -436,13 +433,13 @@ distBuildNEON(const void *pVect1, const void *pVect2,
   const char *buf_a = static_cast<const char *>(pVect1);
   const char *buf_b = static_cast<const char *>(pVect2);
 
-  const uint8_t *sq_a = reinterpret_cast<const uint8_t *>(buf_a);
-  const float *meta_a = reinterpret_cast<const float *>(buf_a + dim + dim);
+  const uint8_t *packed_a = reinterpret_cast<const uint8_t *>(buf_a);
+  const float *meta_a = reinterpret_cast<const float *>(buf_a + dim);
   const float norm_a = meta_a[0];
   const float sigma_a = meta_a[2];
 
-  const uint8_t *sq_b = reinterpret_cast<const uint8_t *>(buf_b);
-  const float *meta_b = reinterpret_cast<const float *>(buf_b + dim + dim);
+  const uint8_t *packed_b = reinterpret_cast<const uint8_t *>(buf_b);
+  const float *meta_b = reinterpret_cast<const float *>(buf_b + dim);
   const float norm_b = meta_b[0];
   const float sigma_b = meta_b[2];
 
@@ -452,22 +449,26 @@ distBuildNEON(const void *pVect1, const void *pVect2,
 
   size_t i = 0;
   for (; i + 4 <= dim; i += 4) {
-    // Scalar gather from centroids table (NEON has no gather)
     float ca[4], cb[4];
-    ca[0] = centroids[sq_a[i]];     cb[0] = centroids[sq_b[i]];
-    ca[1] = centroids[sq_a[i + 1]]; cb[1] = centroids[sq_b[i + 1]];
-    ca[2] = centroids[sq_a[i + 2]]; cb[2] = centroids[sq_b[i + 2]];
-    ca[3] = centroids[sq_a[i + 3]]; cb[3] = centroids[sq_b[i + 3]];
+    ca[0] = centroids[packed_a[i] >> 1];
+    cb[0] = centroids[packed_b[i] >> 1];
+    ca[1] = centroids[packed_a[i + 1] >> 1];
+    cb[1] = centroids[packed_b[i + 1] >> 1];
+    ca[2] = centroids[packed_a[i + 2] >> 1];
+    cb[2] = centroids[packed_b[i + 2] >> 1];
+    ca[3] = centroids[packed_a[i + 3] >> 1];
+    cb[3] = centroids[packed_b[i + 3] >> 1];
 
     float32x4_t va = vmulq_f32(vld1q_f32(ca), v_sigma_a);
     float32x4_t vb = vmulq_f32(vld1q_f32(cb), v_sigma_b);
-    sum = vmlaq_f32(sum, va, vb);  // fused multiply-add
+    sum = vmlaq_f32(sum, va, vb);
   }
 
   float ip_rot = vaddvq_f32(sum);
 
   for (; i < dim; ++i)
-    ip_rot += (centroids[sq_a[i]] * sigma_a) * (centroids[sq_b[i]] * sigma_b);
+    ip_rot += (centroids[packed_a[i] >> 1] * sigma_a) *
+              (centroids[packed_b[i] >> 1] * sigma_b);
 
   const float ip = ip_rot * norm_a * norm_b;
   return std::max(0.0f, norm_a * norm_a + norm_b * norm_b - 2.0f * ip);
@@ -480,14 +481,11 @@ distBuildNEON(const void *pVect1, const void *pVect2,
 // ---------------------------------------------------------------------------
 #if defined(USE_SSE)
 
-static float
-distSearchSSE(const TurboQuantPreparedQuery *pq,
-              const char *code_buf,
-              const TurboQuantSpace *space) {
+static float distSearchSSE(const TurboQuantPreparedQuery *pq,
+                           const char *code_buf, const TurboQuantSpace *space) {
   const size_t dim = tqsDim(space);
-  const uint8_t *sq_packed = reinterpret_cast<const uint8_t *>(code_buf);
-  const int8_t *qjl_signs = reinterpret_cast<const int8_t *>(code_buf + dim);
-  const float *meta = reinterpret_cast<const float *>(code_buf + dim + dim);
+  const uint8_t *packed = reinterpret_cast<const uint8_t *>(code_buf);
+  const float *meta = reinterpret_cast<const float *>(code_buf + dim);
   const float x_norm = meta[0];
   const float gamma = meta[1];
   const float sigma = meta[2];
@@ -496,39 +494,37 @@ distSearchSSE(const TurboQuantPreparedQuery *pq,
   const float *q_rot = pq->q_rot.data();
   const float *s_q = pq->s_q.data();
 
-  // Sign-flip mask: XOR with this flips the sign bit of a float
   const __m128i sign_bit = _mm_set1_epi32(static_cast<int>(0x80000000u));
-  const __m128i zero_i8 = _mm_setzero_si128();
 
   __m128 sum_ip = _mm_setzero_ps();
   __m128 sum_qjl = _mm_setzero_ps();
 
   size_t i = 0;
   for (; i + 4 <= dim; i += 4) {
-    // Centroid gather + multiply with q_rot
+    // Centroid gather from interleaved: sq_idx = byte >> 1
     float cv[4];
-    cv[0] = centroids[sq_packed[i]];
-    cv[1] = centroids[sq_packed[i + 1]];
-    cv[2] = centroids[sq_packed[i + 2]];
-    cv[3] = centroids[sq_packed[i + 3]];
-    sum_ip = _mm_add_ps(sum_ip, _mm_mul_ps(_mm_loadu_ps(q_rot + i), _mm_loadu_ps(cv)));
+    cv[0] = centroids[packed[i] >> 1];
+    cv[1] = centroids[packed[i + 1] >> 1];
+    cv[2] = centroids[packed[i + 2] >> 1];
+    cv[3] = centroids[packed[i + 3] >> 1];
+    sum_ip = _mm_add_ps(sum_ip,
+                        _mm_mul_ps(_mm_loadu_ps(q_rot + i), _mm_loadu_ps(cv)));
 
-    // QJL: load 4 float s_q values
+    // QJL: extract bit 0 → neg_mask → conditionally flip sign of s_q
+    //   bit=1 → positive (+1, keep s_q), bit=0 → negative (-1, flip s_q)
+    __m128i bytes =
+        _mm_cvtsi32_si128(*reinterpret_cast<const int32_t *>(packed + i));
+    bytes = _mm_unpacklo_epi8(bytes, bytes);  // 8→16 bit
+    bytes = _mm_unpacklo_epi16(bytes, bytes); // 16→32 bit (one byte per lane)
+    __m128i bit0 = _mm_and_si128(bytes, _mm_set1_epi32(1));
+    __m128i neg_mask = _mm_cmpeq_epi32(bit0, _mm_setzero_si128());
+
     __m128 vsq = _mm_loadu_ps(s_q + i);
-
-    // Load 4 int8 signs, expand to 32-bit, compare < 0 to get mask
-    __m128i signs_i8 = _mm_cvtsi32_si128(*reinterpret_cast<const int32_t *>(qjl_signs + i));
-    signs_i8 = _mm_unpacklo_epi8(signs_i8, signs_i8);   // expand to 16-bit
-    signs_i8 = _mm_unpacklo_epi16(signs_i8, signs_i8);   // expand to 32-bit
-    __m128i neg_mask = _mm_cmplt_epi32(signs_i8, zero_i8);
-
-    // If sign is -1, XOR the float to flip its sign; otherwise keep as is
-    __m128i vsq_i = _mm_castps_si128(vsq);
-    vsq_i = _mm_xor_si128(vsq_i, _mm_and_si128(neg_mask, sign_bit));
+    __m128i vsq_i =
+        _mm_xor_si128(_mm_castps_si128(vsq), _mm_and_si128(neg_mask, sign_bit));
     sum_qjl = _mm_add_ps(sum_qjl, _mm_castsi128_ps(vsq_i));
   }
 
-  // Horizontal sum
   float PORTABLE_ALIGN32 tmp[4];
 
   _mm_store_ps(tmp, sum_ip);
@@ -537,10 +533,9 @@ distSearchSSE(const TurboQuantPreparedQuery *pq,
   _mm_store_ps(tmp, sum_qjl);
   float dot_qjl = tmp[0] + tmp[1] + tmp[2] + tmp[3];
 
-  // Scalar tail (dim is power of 2, ≥ 4, so this shouldn't execute)
   for (; i < dim; ++i) {
-    ip_mse += q_rot[i] * centroids[sq_packed[i]] * sigma;
-    dot_qjl += s_q[i] * qjl_signs[i];
+    ip_mse += q_rot[i] * centroids[packed[i] >> 1] * sigma;
+    dot_qjl += s_q[i] * ((packed[i] & 1) ? 1.0f : -1.0f);
   }
 
   const float correction = tqsScale(space) * gamma * dot_qjl;
@@ -548,9 +543,8 @@ distSearchSSE(const TurboQuantPreparedQuery *pq,
   return std::max(0.0f, pq->q_norm_sq + x_norm * x_norm - 2.0f * ip);
 }
 
-static float
-distBuildSSE(const void *pVect1, const void *pVect2,
-             const void *param_ptr) {
+static float distBuildSSE(const void *pVect1, const void *pVect2,
+                          const void *param_ptr) {
   const auto *space = static_cast<const TurboQuantSpace *>(param_ptr);
   const size_t dim = tqsDim(space);
   const float *centroids = tqsCentroids(space);
@@ -558,13 +552,13 @@ distBuildSSE(const void *pVect1, const void *pVect2,
   const char *buf_a = static_cast<const char *>(pVect1);
   const char *buf_b = static_cast<const char *>(pVect2);
 
-  const uint8_t *sq_a = reinterpret_cast<const uint8_t *>(buf_a);
-  const float *meta_a = reinterpret_cast<const float *>(buf_a + dim + dim);
+  const uint8_t *packed_a = reinterpret_cast<const uint8_t *>(buf_a);
+  const float *meta_a = reinterpret_cast<const float *>(buf_a + dim);
   const float norm_a = meta_a[0];
   const float sigma_a = meta_a[2];
 
-  const uint8_t *sq_b = reinterpret_cast<const uint8_t *>(buf_b);
-  const float *meta_b = reinterpret_cast<const float *>(buf_b + dim + dim);
+  const uint8_t *packed_b = reinterpret_cast<const uint8_t *>(buf_b);
+  const float *meta_b = reinterpret_cast<const float *>(buf_b + dim);
   const float norm_b = meta_b[0];
   const float sigma_b = meta_b[2];
 
@@ -574,12 +568,15 @@ distBuildSSE(const void *pVect1, const void *pVect2,
 
   size_t i = 0;
   for (; i + 4 <= dim; i += 4) {
-    // Scalar gather from centroids table (SSE has no gather)
     float ca[4], cb[4];
-    ca[0] = centroids[sq_a[i]];     cb[0] = centroids[sq_b[i]];
-    ca[1] = centroids[sq_a[i + 1]]; cb[1] = centroids[sq_b[i + 1]];
-    ca[2] = centroids[sq_a[i + 2]]; cb[2] = centroids[sq_b[i + 2]];
-    ca[3] = centroids[sq_a[i + 3]]; cb[3] = centroids[sq_b[i + 3]];
+    ca[0] = centroids[packed_a[i] >> 1];
+    cb[0] = centroids[packed_b[i] >> 1];
+    ca[1] = centroids[packed_a[i + 1] >> 1];
+    cb[1] = centroids[packed_b[i + 1] >> 1];
+    ca[2] = centroids[packed_a[i + 2] >> 1];
+    cb[2] = centroids[packed_b[i + 2] >> 1];
+    ca[3] = centroids[packed_a[i + 3] >> 1];
+    cb[3] = centroids[packed_b[i + 3] >> 1];
 
     __m128 va = _mm_mul_ps(_mm_loadu_ps(ca), v_sigma_a);
     __m128 vb = _mm_mul_ps(_mm_loadu_ps(cb), v_sigma_b);
@@ -591,7 +588,8 @@ distBuildSSE(const void *pVect1, const void *pVect2,
   float ip_rot = tmp[0] + tmp[1] + tmp[2] + tmp[3];
 
   for (; i < dim; ++i)
-    ip_rot += (centroids[sq_a[i]] * sigma_a) * (centroids[sq_b[i]] * sigma_b);
+    ip_rot += (centroids[packed_a[i] >> 1] * sigma_a) *
+              (centroids[packed_b[i] >> 1] * sigma_b);
 
   const float ip = ip_rot * norm_a * norm_b;
   return std::max(0.0f, norm_a * norm_a + norm_b * norm_b - 2.0f * ip);
@@ -604,14 +602,11 @@ distBuildSSE(const void *pVect1, const void *pVect2,
 // ---------------------------------------------------------------------------
 #if defined(USE_AVX)
 
-static float
-distSearchAVX(const TurboQuantPreparedQuery *pq,
-              const char *code_buf,
-              const TurboQuantSpace *space) {
+static float distSearchAVX(const TurboQuantPreparedQuery *pq,
+                           const char *code_buf, const TurboQuantSpace *space) {
   const size_t dim = tqsDim(space);
-  const uint8_t *sq_packed = reinterpret_cast<const uint8_t *>(code_buf);
-  const int8_t *qjl_signs = reinterpret_cast<const int8_t *>(code_buf + dim);
-  const float *meta = reinterpret_cast<const float *>(code_buf + dim + dim);
+  const uint8_t *packed = reinterpret_cast<const uint8_t *>(code_buf);
+  const float *meta = reinterpret_cast<const float *>(code_buf + dim);
   const float x_norm = meta[0];
   const float gamma = meta[1];
   const float sigma = meta[2];
@@ -621,58 +616,53 @@ distSearchAVX(const TurboQuantPreparedQuery *pq,
   const float *s_q = pq->s_q.data();
 
   const __m256i sign_bit = _mm256_set1_epi32(static_cast<int>(0x80000000u));
-  const __m256i zero_i8 = _mm256_setzero_si256();
 
   __m256 sum_ip = _mm256_setzero_ps();
   __m256 sum_qjl = _mm256_setzero_ps();
 
   size_t i = 0;
   for (; i + 8 <= dim; i += 8) {
-    // Centroid gather from small table + multiply with q_rot
+    // Centroid gather: sq_idx = byte >> 1
 #ifdef __AVX2__
-    __m256i idx = _mm256_set_epi32(
-        sq_packed[i+7], sq_packed[i+6], sq_packed[i+5], sq_packed[i+4],
-        sq_packed[i+3], sq_packed[i+2], sq_packed[i+1], sq_packed[i]);
+    __m256i idx = _mm256_set_epi32(packed[i + 7] >> 1, packed[i + 6] >> 1,
+                                   packed[i + 5] >> 1, packed[i + 4] >> 1,
+                                   packed[i + 3] >> 1, packed[i + 2] >> 1,
+                                   packed[i + 1] >> 1, packed[i] >> 1);
     __m256 vc = _mm256_i32gather_ps(centroids, idx, 4);
 #else
     __m256 vc = _mm256_set_ps(
-        centroids[sq_packed[i+7]], centroids[sq_packed[i+6]],
-        centroids[sq_packed[i+5]], centroids[sq_packed[i+4]],
-        centroids[sq_packed[i+3]], centroids[sq_packed[i+2]],
-        centroids[sq_packed[i+1]], centroids[sq_packed[i]]);
+        centroids[packed[i + 7] >> 1], centroids[packed[i + 6] >> 1],
+        centroids[packed[i + 5] >> 1], centroids[packed[i + 4] >> 1],
+        centroids[packed[i + 3] >> 1], centroids[packed[i + 2] >> 1],
+        centroids[packed[i + 1] >> 1], centroids[packed[i] >> 1]);
 #endif
-    sum_ip = _mm256_add_ps(sum_ip, _mm256_mul_ps(_mm256_loadu_ps(q_rot + i), vc));
+    sum_ip =
+        _mm256_add_ps(sum_ip, _mm256_mul_ps(_mm256_loadu_ps(q_rot + i), vc));
 
-    // QJL: load 8 floats from s_q, sign-flip based on qjl_signs
+    // QJL: extract bit 0 → neg_mask → conditionally flip sign of s_q
+    //   bit=1 → positive (+1, keep s_q), bit=0 → negative (-1, flip s_q)
     __m256 vsq = _mm256_loadu_ps(s_q + i);
 
-    int64_t signs_raw;
-    std::memcpy(&signs_raw, qjl_signs + i, 8);
-    __m128i signs_i8 = _mm_set1_epi64x(signs_raw);
-
 #ifdef __AVX2__
-    __m256i signs_i32 = _mm256_cvtepi8_epi32(signs_i8);
-    __m256i neg_mask = _mm256_cmpgt_epi32(zero_i8, signs_i32);
+    __m128i bytes8 =
+        _mm_loadl_epi64(reinterpret_cast<const __m128i *>(packed + i));
+    __m256i bytes32 = _mm256_cvtepu8_epi32(bytes8);
+    __m256i bit0 = _mm256_and_si256(bytes32, _mm256_set1_epi32(1));
+    __m256i neg_mask = _mm256_cmpeq_epi32(bit0, _mm256_setzero_si256());
 #else
-    __m128i lo8 = signs_i8;
-    __m128i lo16 = _mm_unpacklo_epi8(lo8, lo8);
-    __m128i lo_lo32 = _mm_unpacklo_epi16(lo16, lo16);
-    __m128i lo_hi32 = _mm_unpackhi_epi16(lo16, lo16);
-    lo_lo32 = _mm_srai_epi32(lo_lo32, 24);
-    lo_hi32 = _mm_srai_epi32(lo_hi32, 24);
-    __m256i signs_i32 = _mm256_insertf128_si256(
-        _mm256_castsi128_si256(lo_lo32), lo_hi32, 1);
-    __m256i neg_mask = _mm256_castps_si256(
-        _mm256_cmp_ps(_mm256_castsi256_ps(signs_i32),
-                      _mm256_setzero_ps(), _CMP_LT_OQ));
+    __m256i neg_mask = _mm256_set_epi32(
+        (packed[i + 7] & 1) ? 0 : -1, (packed[i + 6] & 1) ? 0 : -1,
+        (packed[i + 5] & 1) ? 0 : -1, (packed[i + 4] & 1) ? 0 : -1,
+        (packed[i + 3] & 1) ? 0 : -1, (packed[i + 2] & 1) ? 0 : -1,
+        (packed[i + 1] & 1) ? 0 : -1, (packed[i] & 1) ? 0 : -1);
 #endif
 
-    __m256i vsq_i = _mm256_castps_si256(vsq);
-    vsq_i = _mm256_xor_si256(vsq_i, _mm256_and_si256(neg_mask, sign_bit));
+    __m256i vsq_i = _mm256_xor_si256(_mm256_castps_si256(vsq),
+                                     _mm256_and_si256(neg_mask, sign_bit));
     sum_qjl = _mm256_add_ps(sum_qjl, _mm256_castsi256_ps(vsq_i));
   }
 
-  // Horizontal sum (AVX → 128-bit halves → scalar)
+  // Horizontal sum
   __m128 hi_ip = _mm256_extractf128_ps(sum_ip, 1);
   __m128 lo_ip = _mm256_castps256_ps128(sum_ip);
   __m128 s_ip = _mm_add_ps(lo_ip, hi_ip);
@@ -687,10 +677,9 @@ distSearchAVX(const TurboQuantPreparedQuery *pq,
   s_qjl = _mm_add_ss(s_qjl, _mm_shuffle_ps(s_qjl, s_qjl, 1));
   float dot_qjl = _mm_cvtss_f32(s_qjl);
 
-  // Scalar tail
   for (; i < dim; ++i) {
-    ip_mse += q_rot[i] * centroids[sq_packed[i]] * sigma;
-    dot_qjl += s_q[i] * qjl_signs[i];
+    ip_mse += q_rot[i] * centroids[packed[i] >> 1] * sigma;
+    dot_qjl += s_q[i] * ((packed[i] & 1) ? 1.0f : -1.0f);
   }
 
   const float correction = tqsScale(space) * gamma * dot_qjl;
@@ -698,9 +687,8 @@ distSearchAVX(const TurboQuantPreparedQuery *pq,
   return std::max(0.0f, pq->q_norm_sq + x_norm * x_norm - 2.0f * ip);
 }
 
-static float
-distBuildAVX(const void *pVect1, const void *pVect2,
-             const void *param_ptr) {
+static float distBuildAVX(const void *pVect1, const void *pVect2,
+                          const void *param_ptr) {
   const auto *space = static_cast<const TurboQuantSpace *>(param_ptr);
   const size_t dim = tqsDim(space);
   const float *centroids = tqsCentroids(space);
@@ -708,13 +696,13 @@ distBuildAVX(const void *pVect1, const void *pVect2,
   const char *buf_a = static_cast<const char *>(pVect1);
   const char *buf_b = static_cast<const char *>(pVect2);
 
-  const uint8_t *sq_a = reinterpret_cast<const uint8_t *>(buf_a);
-  const float *meta_a = reinterpret_cast<const float *>(buf_a + dim + dim);
+  const uint8_t *packed_a = reinterpret_cast<const uint8_t *>(buf_a);
+  const float *meta_a = reinterpret_cast<const float *>(buf_a + dim);
   const float norm_a = meta_a[0];
   const float sigma_a = meta_a[2];
 
-  const uint8_t *sq_b = reinterpret_cast<const uint8_t *>(buf_b);
-  const float *meta_b = reinterpret_cast<const float *>(buf_b + dim + dim);
+  const uint8_t *packed_b = reinterpret_cast<const uint8_t *>(buf_b);
+  const float *meta_b = reinterpret_cast<const float *>(buf_b + dim);
   const float norm_b = meta_b[0];
   const float sigma_b = meta_b[2];
 
@@ -725,36 +713,38 @@ distBuildAVX(const void *pVect1, const void *pVect2,
   size_t i = 0;
   for (; i + 8 <= dim; i += 8) {
 #ifdef __AVX2__
-    // Gather centroids for vector A
-    __m256i idx_a = _mm256_set_epi32(
-        sq_a[i + 7], sq_a[i + 6], sq_a[i + 5], sq_a[i + 4],
-        sq_a[i + 3], sq_a[i + 2], sq_a[i + 1], sq_a[i]);
-    __m256 va = _mm256_mul_ps(_mm256_i32gather_ps(centroids, idx_a, 4), v_sigma_a);
+    __m256i idx_a = _mm256_set_epi32(packed_a[i + 7] >> 1, packed_a[i + 6] >> 1,
+                                     packed_a[i + 5] >> 1, packed_a[i + 4] >> 1,
+                                     packed_a[i + 3] >> 1, packed_a[i + 2] >> 1,
+                                     packed_a[i + 1] >> 1, packed_a[i] >> 1);
+    __m256 va =
+        _mm256_mul_ps(_mm256_i32gather_ps(centroids, idx_a, 4), v_sigma_a);
 
-    // Gather centroids for vector B
-    __m256i idx_b = _mm256_set_epi32(
-        sq_b[i + 7], sq_b[i + 6], sq_b[i + 5], sq_b[i + 4],
-        sq_b[i + 3], sq_b[i + 2], sq_b[i + 1], sq_b[i]);
-    __m256 vb = _mm256_mul_ps(_mm256_i32gather_ps(centroids, idx_b, 4), v_sigma_b);
+    __m256i idx_b = _mm256_set_epi32(packed_b[i + 7] >> 1, packed_b[i + 6] >> 1,
+                                     packed_b[i + 5] >> 1, packed_b[i + 4] >> 1,
+                                     packed_b[i + 3] >> 1, packed_b[i + 2] >> 1,
+                                     packed_b[i + 1] >> 1, packed_b[i] >> 1);
+    __m256 vb =
+        _mm256_mul_ps(_mm256_i32gather_ps(centroids, idx_b, 4), v_sigma_b);
 #else
-    // AVX without AVX2: scalar gather + pack
     __m256 va = _mm256_mul_ps(
-        _mm256_set_ps(centroids[sq_a[i+7]], centroids[sq_a[i+6]],
-                      centroids[sq_a[i+5]], centroids[sq_a[i+4]],
-                      centroids[sq_a[i+3]], centroids[sq_a[i+2]],
-                      centroids[sq_a[i+1]], centroids[sq_a[i]]),
+        _mm256_set_ps(
+            centroids[packed_a[i + 7] >> 1], centroids[packed_a[i + 6] >> 1],
+            centroids[packed_a[i + 5] >> 1], centroids[packed_a[i + 4] >> 1],
+            centroids[packed_a[i + 3] >> 1], centroids[packed_a[i + 2] >> 1],
+            centroids[packed_a[i + 1] >> 1], centroids[packed_a[i] >> 1]),
         v_sigma_a);
     __m256 vb = _mm256_mul_ps(
-        _mm256_set_ps(centroids[sq_b[i+7]], centroids[sq_b[i+6]],
-                      centroids[sq_b[i+5]], centroids[sq_b[i+4]],
-                      centroids[sq_b[i+3]], centroids[sq_b[i+2]],
-                      centroids[sq_b[i+1]], centroids[sq_b[i]]),
+        _mm256_set_ps(
+            centroids[packed_b[i + 7] >> 1], centroids[packed_b[i + 6] >> 1],
+            centroids[packed_b[i + 5] >> 1], centroids[packed_b[i + 4] >> 1],
+            centroids[packed_b[i + 3] >> 1], centroids[packed_b[i + 2] >> 1],
+            centroids[packed_b[i + 1] >> 1], centroids[packed_b[i] >> 1]),
         v_sigma_b);
 #endif
     sum = _mm256_add_ps(sum, _mm256_mul_ps(va, vb));
   }
 
-  // Horizontal sum
   __m128 hi = _mm256_extractf128_ps(sum, 1);
   __m128 lo = _mm256_castps256_ps128(sum);
   __m128 s = _mm_add_ps(lo, hi);
@@ -763,7 +753,8 @@ distBuildAVX(const void *pVect1, const void *pVect2,
   float ip_rot = _mm_cvtss_f32(s);
 
   for (; i < dim; ++i)
-    ip_rot += (centroids[sq_a[i]] * sigma_a) * (centroids[sq_b[i]] * sigma_b);
+    ip_rot += (centroids[packed_a[i] >> 1] * sigma_a) *
+              (centroids[packed_b[i] >> 1] * sigma_b);
 
   const float ip = ip_rot * norm_a * norm_b;
   return std::max(0.0f, norm_a * norm_a + norm_b * norm_b - 2.0f * ip);
@@ -790,13 +781,78 @@ distBuildAVX(const void *pVect1, const void *pVect2,
 // Vector i is at offset: 32 + i * dim * element_size.
 // ---------------------------------------------------------------------------
 
-static const uint32_t TQRV_MAGIC   = 0x54515256;  // "TQRV"
+static const uint32_t TQRV_MAGIC = 0x54515256; // "TQRV"
 static const uint32_t TQRV_VERSION = 2;
 
 enum RawVectorDtype : uint32_t {
-    DTYPE_FLOAT32 = 0,
-    DTYPE_FLOAT16 = 1,
+  DTYPE_FLOAT32 = 0,
+  DTYPE_FLOAT16 = 1,
 };
+
+// ===========================================================================
+// Section 0: IEEE 754 float16 ↔ float32 conversion
+//
+// Portable bit-manipulation, no hardware fp16 dependency.
+// Used for compact raw-vector storage (.tqrv dtype=1).
+// ===========================================================================
+
+inline uint16_t float_to_fp16(float val) {
+    uint32_t bits;
+    std::memcpy(&bits, &val, 4);
+    uint32_t sign = (bits >> 16) & 0x8000;
+    int32_t exp = static_cast<int32_t>((bits >> 23) & 0xFF) - 127 + 15;
+    uint32_t frac = bits & 0x7FFFFF;
+
+    if (exp <= 0) {
+        // Underflow → zero (denormals omitted for simplicity)
+        return static_cast<uint16_t>(sign);
+    }
+    if (exp >= 31) {
+        // Overflow → infinity, preserve NaN
+        return static_cast<uint16_t>(sign | 0x7C00 | ((frac != 0) ? 0x0200 : 0));
+    }
+    return static_cast<uint16_t>(sign | (exp << 10) | (frac >> 13));
+}
+
+inline float fp16_to_float(uint16_t h) {
+    uint32_t sign = (static_cast<uint32_t>(h) & 0x8000) << 16;
+    uint32_t exp = (h >> 10) & 0x1F;
+    uint32_t frac = h & 0x03FF;
+
+    uint32_t bits;
+    if (exp == 0) {
+        // Zero or denormal → flush to signed zero
+        bits = sign;
+    } else if (exp == 31) {
+        // Inf / NaN
+        bits = sign | 0x7F800000 | (frac << 13);
+    } else {
+        bits = sign | ((exp - 15 + 127) << 23) | (frac << 13);
+    }
+    float result;
+    std::memcpy(&result, &bits, 4);
+    return result;
+}
+
+#if defined(USE_NEON)
+
+inline uint16_t float_to_fp16_NEON(float val) {
+    // ARM64 с +fp16 — native hardware
+    __fp16 h = static_cast<__fp16>(val);
+    uint16_t res;
+    std::memcpy(&res, &h, sizeof(res));
+    return res;
+}
+
+inline float fp16_to_float_NEON(uint16_t h) {
+    // ARM64 hardware
+    __fp16 fh;
+    std::memcpy(&fh, &h, sizeof(fh));
+    return static_cast<float>(fh);
+}
+
+#endif
+
 
 /// Save raw float32 vectors from an L2-built HNSW index to a flat file.
 /// Must be called BEFORE compressIndex (while data slots still contain floats).
@@ -922,7 +978,7 @@ inline Status loadRawVectors(const std::string &path, const size_t *ids,
   RawVectorDtype dtype = DTYPE_FLOAT32;
   if (version == 1) {
     uint64_t off_tmp;
-    in.read(reinterpret_cast<char *>(&off_tmp), 8);  // data_offset field
+    in.read(reinterpret_cast<char *>(&off_tmp), 8); // data_offset field
     data_offset = off_tmp;
   } else if (version == 2) {
     uint32_t dtype32, reserved;
@@ -972,163 +1028,192 @@ inline Status loadRawVectors(const std::string &path, const size_t *ids,
 // ===========================================================================
 
 class MappedRawVectors {
-    void *mapped_;          ///< mmap base (POSIX) or malloc'd block (Windows)
-    size_t file_size_;      ///< total mapped/allocated size
-    const char *data_;      ///< pointer to first vector byte
-    uint64_t num_vectors_;
-    uint64_t dim_;
-    RawVectorDtype dtype_;
-    size_t elem_size_;      ///< bytes per element: 4 (fp32) or 2 (fp16)
-    size_t vec_bytes_;      ///< dim_ * elem_size_
-    bool is_mmap_;          ///< true = mmap, false = malloc fallback
+  void *mapped_;     ///< mmap base (POSIX) or malloc'd block (Windows)
+  size_t file_size_; ///< total mapped/allocated size
+  const char *data_; ///< pointer to first vector byte
+  uint64_t num_vectors_;
+  uint64_t dim_;
+  RawVectorDtype dtype_;
+  size_t elem_size_; ///< bytes per element: 4 (fp32) or 2 (fp16)
+  size_t vec_bytes_; ///< dim_ * elem_size_
+  bool is_mmap_;     ///< true = mmap, false = malloc fallback
 
- public:
-    MappedRawVectors()
-        : mapped_(nullptr), file_size_(0), data_(nullptr),
-          num_vectors_(0), dim_(0), dtype_(DTYPE_FLOAT32),
-          elem_size_(4), vec_bytes_(0), is_mmap_(false) {}
+public:
+  MappedRawVectors()
+      : mapped_(nullptr), file_size_(0), data_(nullptr), num_vectors_(0),
+        dim_(0), dtype_(DTYPE_FLOAT32), elem_size_(4), vec_bytes_(0),
+        is_mmap_(false) {}
 
-    ~MappedRawVectors() { close(); }
+  ~MappedRawVectors() { close(); }
 
-    // Non-copyable, movable
-    MappedRawVectors(const MappedRawVectors &) = delete;
-    MappedRawVectors &operator=(const MappedRawVectors &) = delete;
-    MappedRawVectors(MappedRawVectors &&o) noexcept { moveFrom(o); }
-    MappedRawVectors &operator=(MappedRawVectors &&o) noexcept {
-        if (this != &o) { close(); moveFrom(o); }
-        return *this;
+  // Non-copyable, movable
+  MappedRawVectors(const MappedRawVectors &) = delete;
+  MappedRawVectors &operator=(const MappedRawVectors &) = delete;
+  MappedRawVectors(MappedRawVectors &&o) noexcept { moveFrom(o); }
+  MappedRawVectors &operator=(MappedRawVectors &&o) noexcept {
+    if (this != &o) {
+      close();
+      moveFrom(o);
     }
+    return *this;
+  }
 
-    /// Open and map a .tqrv file (v1 or v2).
-    Status open(const std::string &path) {
-        if (mapped_)
-            return Status("MappedRawVectors: already open");
+  /// Open and map a .tqrv file (v1 or v2).
+  Status open(const std::string &path) {
+    if (mapped_)
+      return Status("MappedRawVectors: already open");
 
 #ifndef _WIN32
-        // --- POSIX path: mmap ---
-        int fd = ::open(path.c_str(), O_RDONLY);
-        if (fd < 0)
-            return Status("MappedRawVectors: cannot open file");
+    // --- POSIX path: mmap ---
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0)
+      return Status("MappedRawVectors: cannot open file");
 
-        struct stat st;
-        if (fstat(fd, &st) != 0) { ::close(fd); return Status("MappedRawVectors: fstat failed"); }
-        file_size_ = static_cast<size_t>(st.st_size);
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+      ::close(fd);
+      return Status("MappedRawVectors: fstat failed");
+    }
+    file_size_ = static_cast<size_t>(st.st_size);
 
-        mapped_ = mmap(nullptr, file_size_, PROT_READ, MAP_PRIVATE, fd, 0);
-        ::close(fd);
-        if (mapped_ == MAP_FAILED) { mapped_ = nullptr; return Status("MappedRawVectors: mmap failed"); }
-
-        madvise(mapped_, file_size_, MADV_RANDOM);
-        is_mmap_ = true;
-#else
-        // --- Windows fallback: read into memory ---
-        std::ifstream in(path, std::ios::binary | std::ios::ate);
-        if (!in.good())
-            return Status("MappedRawVectors: cannot open file");
-        file_size_ = static_cast<size_t>(in.tellg());
-        in.seekg(0);
-
-        mapped_ = std::malloc(file_size_);
-        if (!mapped_)
-            return Status("MappedRawVectors: malloc failed");
-        in.read(static_cast<char *>(mapped_), file_size_);
-        if (!in.good()) { std::free(mapped_); mapped_ = nullptr; return Status("MappedRawVectors: read failed"); }
-        is_mmap_ = false;
-#endif
-
-        return parseHeader();
+    mapped_ = mmap(nullptr, file_size_, PROT_READ, MAP_PRIVATE, fd, 0);
+    ::close(fd);
+    if (mapped_ == MAP_FAILED) {
+      mapped_ = nullptr;
+      return Status("MappedRawVectors: mmap failed");
     }
 
-    void close() {
-        if (!mapped_) return;
+    madvise(mapped_, file_size_, MADV_RANDOM);
+    is_mmap_ = true;
+#else
+    // --- Windows fallback: read into memory ---
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in.good())
+      return Status("MappedRawVectors: cannot open file");
+    file_size_ = static_cast<size_t>(in.tellg());
+    in.seekg(0);
+
+    mapped_ = std::malloc(file_size_);
+    if (!mapped_)
+      return Status("MappedRawVectors: malloc failed");
+    in.read(static_cast<char *>(mapped_), file_size_);
+    if (!in.good()) {
+      std::free(mapped_);
+      mapped_ = nullptr;
+      return Status("MappedRawVectors: read failed");
+    }
+    is_mmap_ = false;
+#endif
+
+    return parseHeader();
+  }
+
+  void close() {
+    if (!mapped_)
+      return;
 #ifndef _WIN32
-        if (is_mmap_)
-            munmap(mapped_, file_size_);
-        else
-            std::free(mapped_);
+    if (is_mmap_)
+      munmap(mapped_, file_size_);
+    else
+      std::free(mapped_);
 #else
-        std::free(mapped_);
+    std::free(mapped_);
 #endif
-        mapped_ = nullptr;
-        data_ = nullptr;
+    mapped_ = nullptr;
+    data_ = nullptr;
+  }
+
+  // -- Accessors ----------------------------------------------------------
+
+  bool is_open() const { return mapped_ != nullptr; }
+  uint64_t num_vectors() const { return num_vectors_; }
+  uint64_t dim() const { return dim_; }
+  RawVectorDtype dtype() const { return dtype_; }
+
+  /// Zero-copy access for float32 files.  Returns nullptr for float16.
+  const float *get_float32(uint64_t label) const {
+    assert(label < num_vectors_ && "get_float32: label out of range");
+    if (dtype_ != DTYPE_FLOAT32)
+      return nullptr;
+    return reinterpret_cast<const float *>(data_ + label * vec_bytes_);
+  }
+
+  /// Universal access: writes dim floats to buf.
+  /// For float32 — memcpy.  For float16 — converts to float32.
+  void get(uint64_t label, float *buf) const {
+    assert(label < num_vectors_ && "get: label out of range");
+    const char *src = data_ + label * vec_bytes_;
+    if (dtype_ == DTYPE_FLOAT32) {
+      std::memcpy(buf, src, vec_bytes_);
+    } else {
+      const uint16_t *fp16 = reinterpret_cast<const uint16_t *>(src);
+      for (uint64_t i = 0; i < dim_; ++i)
+        buf[i] = fp16_to_float(fp16[i]);
+    }
+  }
+
+private:
+  Status parseHeader() {
+    if (file_size_ < 32) {
+      close();
+      return Status("MappedRawVectors: file too small");
     }
 
-    // -- Accessors ----------------------------------------------------------
+    const char *hdr = static_cast<const char *>(mapped_);
+    uint32_t magic, version;
+    std::memcpy(&magic, hdr, 4);
+    std::memcpy(&version, hdr + 4, 4);
 
-    bool is_open() const { return mapped_ != nullptr; }
-    uint64_t num_vectors() const { return num_vectors_; }
-    uint64_t dim() const { return dim_; }
-    RawVectorDtype dtype() const { return dtype_; }
-
-    /// Zero-copy access for float32 files.  Returns nullptr for float16.
-    const float *get_float32(uint64_t label) const {
-        assert(label < num_vectors_ && "get_float32: label out of range");
-        if (dtype_ != DTYPE_FLOAT32) return nullptr;
-        return reinterpret_cast<const float *>(data_ + label * vec_bytes_);
+    if (magic != TQRV_MAGIC) {
+      close();
+      return Status("MappedRawVectors: invalid magic");
     }
 
-    /// Universal access: writes dim floats to buf.
-    /// For float32 — memcpy.  For float16 — converts to float32.
-    void get(uint64_t label, float *buf) const {
-        assert(label < num_vectors_ && "get: label out of range");
-        const char *src = data_ + label * vec_bytes_;
-        if (dtype_ == DTYPE_FLOAT32) {
-            std::memcpy(buf, src, vec_bytes_);
-        } else {
-            const uint16_t *fp16 = reinterpret_cast<const uint16_t *>(src);
-            for (uint64_t i = 0; i < dim_; ++i)
-                buf[i] = fp16_to_float(fp16[i]);
-        }
+    std::memcpy(&num_vectors_, hdr + 8, 8);
+    std::memcpy(&dim_, hdr + 16, 8);
+
+    uint64_t data_offset = 32;
+    if (version == 1) {
+      dtype_ = DTYPE_FLOAT32;
+      std::memcpy(&data_offset, hdr + 24, 8);
+    } else if (version == 2) {
+      uint32_t dtype32;
+      std::memcpy(&dtype32, hdr + 24, 4);
+      dtype_ = static_cast<RawVectorDtype>(dtype32);
+    } else {
+      close();
+      return Status("MappedRawVectors: unsupported version");
     }
 
- private:
-    Status parseHeader() {
-        if (file_size_ < 32) { close(); return Status("MappedRawVectors: file too small"); }
+    elem_size_ = (dtype_ == DTYPE_FLOAT16) ? 2 : 4;
+    vec_bytes_ = dim_ * elem_size_;
+    data_ = static_cast<const char *>(mapped_) + data_offset;
 
-        const char *hdr = static_cast<const char *>(mapped_);
-        uint32_t magic, version;
-        std::memcpy(&magic, hdr, 4);
-        std::memcpy(&version, hdr + 4, 4);
-
-        if (magic != TQRV_MAGIC) { close(); return Status("MappedRawVectors: invalid magic"); }
-
-        std::memcpy(&num_vectors_, hdr + 8, 8);
-        std::memcpy(&dim_, hdr + 16, 8);
-
-        uint64_t data_offset = 32;
-        if (version == 1) {
-            dtype_ = DTYPE_FLOAT32;
-            std::memcpy(&data_offset, hdr + 24, 8);
-        } else if (version == 2) {
-            uint32_t dtype32;
-            std::memcpy(&dtype32, hdr + 24, 4);
-            dtype_ = static_cast<RawVectorDtype>(dtype32);
-        } else {
-            close();
-            return Status("MappedRawVectors: unsupported version");
-        }
-
-        elem_size_ = (dtype_ == DTYPE_FLOAT16) ? 2 : 4;
-        vec_bytes_ = dim_ * elem_size_;
-        data_ = static_cast<const char *>(mapped_) + data_offset;
-
-        size_t expected = data_offset + num_vectors_ * vec_bytes_;
-        if (file_size_ < expected) { close(); return Status("MappedRawVectors: file truncated"); }
-
-        return OkStatus();
+    size_t expected = data_offset + num_vectors_ * vec_bytes_;
+    if (file_size_ < expected) {
+      close();
+      return Status("MappedRawVectors: file truncated");
     }
 
-    void moveFrom(MappedRawVectors &o) {
-        mapped_ = o.mapped_;       o.mapped_ = nullptr;
-        file_size_ = o.file_size_; o.file_size_ = 0;
-        data_ = o.data_;           o.data_ = nullptr;
-        num_vectors_ = o.num_vectors_; o.num_vectors_ = 0;
-        dim_ = o.dim_;             o.dim_ = 0;
-        dtype_ = o.dtype_;
-        elem_size_ = o.elem_size_;
-        vec_bytes_ = o.vec_bytes_;
-        is_mmap_ = o.is_mmap_;
-    }
+    return OkStatus();
+  }
+
+  void moveFrom(MappedRawVectors &o) {
+    mapped_ = o.mapped_;
+    o.mapped_ = nullptr;
+    file_size_ = o.file_size_;
+    o.file_size_ = 0;
+    data_ = o.data_;
+    o.data_ = nullptr;
+    num_vectors_ = o.num_vectors_;
+    o.num_vectors_ = 0;
+    dim_ = o.dim_;
+    o.dim_ = 0;
+    dtype_ = o.dtype_;
+    elem_size_ = o.elem_size_;
+    vec_bytes_ = o.vec_bytes_;
+    is_mmap_ = o.is_mmap_;
+  }
 };
 
 // ===========================================================================
@@ -1164,21 +1249,25 @@ class TurboQuantIndex {
   MappedRawVectors raw_vectors_;
 
 public:
-  TurboQuantIndex(size_t dim, int bits_per_coord = 8,
-                  uint64_t rot_seed = 42, uint64_t qjl_seed = 137)
-      : dim_(dim), bits_per_coord_(bits_per_coord),
-        rot_seed_(rot_seed), qjl_seed_(qjl_seed) {}
+  TurboQuantIndex(size_t dim, int bits_per_coord = 8, uint64_t rot_seed = 42,
+                  uint64_t qjl_seed = 137)
+      : dim_(dim), bits_per_coord_(bits_per_coord), rot_seed_(rot_seed),
+        qjl_seed_(qjl_seed) {}
 
   // -- Build ----------------------------------------------------------------
 
   /// Initialize space and HNSW graph for building. Call addPoint() to populate.
-  void initBuild(size_t max_elements, size_t M = 16, size_t ef_construction = 200) {
-    space_.reset(new TurboQuantSpace(dim_, bits_per_coord_, rot_seed_, qjl_seed_));
-    hnsw_.reset(new HierarchicalNSW<float>(space_.get(), max_elements, M, ef_construction));
+  void initBuild(size_t max_elements, size_t M = 16,
+                 size_t ef_construction = 200) {
+    space_.reset(
+        new TurboQuantSpace(dim_, bits_per_coord_, rot_seed_, qjl_seed_));
+    hnsw_.reset(new HierarchicalNSW<float>(space_.get(), max_elements, M,
+                                           ef_construction));
   }
 
-  /// Encode a float vector and add it to the index. Thread-safe (addPoint uses mutexes).
-  /// Caller must provide a thread-local buffer of size codeSizeBytes().
+  /// Encode a float vector and add it to the index. Thread-safe (addPoint uses
+  /// mutexes). Caller must provide a thread-local buffer of size
+  /// codeSizeBytes().
   void addPoint(const float *vec, labeltype label, char *encode_buf) {
     space_->encodeVector(vec, encode_buf);
     hnsw_->addPoint(encode_buf, label);
@@ -1186,8 +1275,8 @@ public:
 
   /// Build a TQ-compressed HNSW index from raw float vectors (single-threaded).
   /// data[i] points to a float[dim] vector for label i.
-  Status build(const float *const *data, size_t n,
-               size_t M = 16, size_t ef_construction = 200) {
+  Status build(const float *const *data, size_t n, size_t M = 16,
+               size_t ef_construction = 200) {
     initBuild(n, M, ef_construction);
 
     std::vector<char> buf(space_->codeSizeBytes());
@@ -1198,8 +1287,8 @@ public:
   }
 
   /// Build from contiguous array: data points to n*dim floats, row-major.
-  Status build(const float *data, size_t n,
-               size_t M = 16, size_t ef_construction = 200) {
+  Status build(const float *data, size_t n, size_t M = 16,
+               size_t ef_construction = 200) {
     std::vector<const float *> ptrs(n);
     for (size_t i = 0; i < n; ++i)
       ptrs[i] = data + i * dim_;
@@ -1211,8 +1300,7 @@ public:
   /// Save index and optionally raw vectors for re-ranking.
   /// raw_data points to the original float vectors (n * dim, row-major).
   /// If raw_path is empty, raw vectors are not saved.
-  Status save(const std::string &index_path,
-              const std::string &raw_path = "",
+  Status save(const std::string &index_path, const std::string &raw_path = "",
               const float *raw_data = nullptr, size_t n = 0,
               RawVectorDtype dtype = DTYPE_FLOAT32) const {
     if (!hnsw_)
@@ -1259,15 +1347,16 @@ public:
   }
 
   /// Load index from disk. raw_path is optional (enables searchRerank).
-  Status load(const std::string &index_path,
-              const std::string &raw_path = "") {
-    space_.reset(new TurboQuantSpace(dim_, bits_per_coord_, rot_seed_, qjl_seed_));
+  Status load(const std::string &index_path, const std::string &raw_path = "") {
+    space_.reset(
+        new TurboQuantSpace(dim_, bits_per_coord_, rot_seed_, qjl_seed_));
     hnsw_.reset(new HierarchicalNSW<float>(space_.get(), index_path));
     space_->setSearchMode(*hnsw_);
 
     if (!raw_path.empty()) {
       auto st = raw_vectors_.open(raw_path);
-      if (!st.ok()) return st;
+      if (!st.ok())
+        return st;
     }
 
     return OkStatus();
@@ -1276,28 +1365,26 @@ public:
   // -- Search ---------------------------------------------------------------
 
   void setEf(size_t ef) {
-    if (hnsw_) hnsw_->setEf(ef);
+    if (hnsw_)
+      hnsw_->setEf(ef);
   }
 
-  size_t getEf() const {
-    return hnsw_ ? hnsw_->ef_ : 0;
-  }
+  size_t getEf() const { return hnsw_ ? hnsw_->ef_ : 0; }
 
   /// TQ-only search. Thread-safe.
   /// Returns priority queue of (distance, label) pairs, worst first.
-  std::priority_queue<std::pair<float, labeltype>>
-  search(const float *query, size_t k) const {
+  std::priority_queue<std::pair<float, labeltype>> search(const float *query,
+                                                          size_t k) const {
     ensureSearchMode();
     auto pq = space_->prepareQuery(query);
     return hnsw_->searchKnn(&pq, k);
   }
 
   /// TQ search + exact L2 re-ranking from mmap'd raw vectors. Thread-safe.
-  /// Retrieves rerank_ef candidates via TQ, re-ranks by exact L2, returns top-k.
-  /// rerank_ef controls the number of TQ candidates to re-rank.
-  /// Set hnsw ef >= rerank_ef before calling (via setEf).
-  /// Default rerank_ef = 0 means use current ef (i.e. re-rank all candidates
-  /// that searchKnn returns).
+  /// Retrieves rerank_ef candidates via TQ, re-ranks by exact L2, returns
+  /// top-k. rerank_ef controls the number of TQ candidates to re-rank. Set hnsw
+  /// ef >= rerank_ef before calling (via setEf). Default rerank_ef = 0 means
+  /// use current ef (i.e. re-rank all candidates that searchKnn returns).
   std::vector<std::pair<float, labeltype>>
   searchRerank(const float *query, size_t k, size_t rerank_ef = 0) const {
     if (!raw_vectors_.is_open())
@@ -1355,7 +1442,9 @@ public:
 
   bool hasRawVectors() const { return raw_vectors_.is_open(); }
   size_t dim() const { return dim_; }
-  size_t numElements() const { return hnsw_ ? hnsw_->cur_element_count.load() : 0; }
+  size_t numElements() const {
+    return hnsw_ ? hnsw_->cur_element_count.load() : 0;
+  }
   size_t codeSizeBytes() const { return space_ ? space_->codeSizeBytes() : 0; }
 
   const TurboQuantSpace *space() const { return space_.get(); }
@@ -1367,8 +1456,8 @@ private:
     // Lazily switch on first search. Safe: setSearchMode just writes
     // two pointers, and concurrent reads of the same value are fine.
     if (hnsw_->fstdistfunc_ != space_->getSearchDistFunc()) {
-      const_cast<TurboQuantSpace *>(space_.get())->setSearchMode(
-          *const_cast<HierarchicalNSW<float> *>(hnsw_.get()));
+      const_cast<TurboQuantSpace *>(space_.get())
+          ->setSearchMode(*const_cast<HierarchicalNSW<float> *>(hnsw_.get()));
     }
   }
 };

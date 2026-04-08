@@ -379,7 +379,7 @@ int main(int argc, char **argv) {
     hnswlib::HierarchicalNSW<float> hnsw_l2(&l2space, N, M, EF_CONSTRUCTION);
 
     hnsw_l2.addPoint(base_data[0].data(), 0);
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(static, 16)
     for (int i = 1; i < static_cast<int>(N); ++i) {
       hnsw_l2.addPoint(base_data[i].data(), static_cast<size_t>(i));
     }
@@ -571,7 +571,7 @@ int main(int argc, char **argv) {
       hnswlib::HierarchicalNSW<float> hnsw_l2(&l2space, HY_N, M,
                                               EF_CONSTRUCTION);
       hnsw_l2.addPoint(base_data[0].data(), 0);
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(static, 16)
       for (int i = 1; i < static_cast<int>(HY_N); ++i)
         hnsw_l2.addPoint(base_data[i].data(), static_cast<size_t>(i));
 
@@ -686,7 +686,7 @@ int main(int argc, char **argv) {
 
         StopWatch sw;
         hnsw.addPoint(base_data[0].data(), 0);
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(static, 16)
         for (int i = 1; i < static_cast<int>(N); ++i)
           hnsw.addPoint(base_data[i].data(), static_cast<size_t>(i));
         double build_time = sw.elapsedSeconds();

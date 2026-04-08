@@ -18,8 +18,8 @@ Key parameters:
 """
 
 dim = 512
-num_elements = 1000000
-num_queries = 100
+num_elements = 100000
+num_queries = 10000
 k = 10
 ef = 200            # same ef for fair comparison between L2 and TQ
 rerank_ef = 200     # candidates to re-rank (>= ef for best results)

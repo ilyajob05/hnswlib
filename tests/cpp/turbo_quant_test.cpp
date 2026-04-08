@@ -480,11 +480,11 @@ void test_memory_footprint() {
             << (raw_bytes * 1e6 / (1024.0 * 1024.0)) << " MB -> "
             << (tq_bytes * 1e6 / (1024.0 * 1024.0)) << " MB" << std::endl;
 
-  // Tight-packed estimate (Phase 2 target)
+  // Tight bit-packed estimate (if SQ indices were sub-byte packed)
   size_t tight_sq = (D * enc.mseBits() + 7) / 8;
   size_t tight_qjl = (D + 7) / 8;
   size_t tight_total = tight_sq + tight_qjl + sizeof(float) * 3;
-  std::cout << "\n  Tight-packed estimate: " << tight_total << " bytes ("
+  std::cout << "\n  Tight bit-packed estimate: " << tight_total << " bytes ("
             << std::setprecision(1)
             << static_cast<float>(raw_bytes) / tight_total << "x)" << std::endl;
 }
@@ -1112,7 +1112,7 @@ void test_benchmark() {
 // Test: LUT correctness — verify LUT-based distSearch matches reference
 // ---------------------------------------------------------------------------
 bool test_lut_correctness(int bits_per_coord = 4) {
-  int mse_bits = bits_per_coord - 1;
+  // int mse_bits = bits_per_coord - 1;
   std::cout << "=== Test: LUT distSearch correctness (b=" << bits_per_coord
             << ") ===" << std::endl;
 
@@ -1146,8 +1146,9 @@ bool test_lut_correctness(int bits_per_coord = 4) {
 
     for (size_t i = 0; i < N; ++i) {
       const char *buf = codes[i].data();
-      const uint8_t *sq_packed = reinterpret_cast<const uint8_t *>(buf);
-      const float *meta = reinterpret_cast<const float *>(buf + D + D);
+      // Interleaved layout: byte[i] = (sq_idx << 1) | qjl_bit, meta at buf + D
+      const uint8_t *packed = reinterpret_cast<const uint8_t *>(buf);
+      const float *meta = reinterpret_cast<const float *>(buf + D);
       const float x_norm = meta[0];
       const float gamma = meta[1];
       const float sigma = meta[2];
@@ -1155,17 +1156,18 @@ bool test_lut_correctness(int bits_per_coord = 4) {
       // Reference MSE term (direct compute)
       float ip_mse_ref = 0.0f;
       for (size_t d = 0; d < D; ++d)
-        ip_mse_ref += pq.q_rot[d] * centroids[sq_packed[d]] * sigma;
+        ip_mse_ref += pq.q_rot[d] * centroids[packed[d] >> 1] * sigma;
 
       // Verify full distance via TurboQuantSpace search dispatch
       float dist_dispatch = tq_space.getSearchDistFunc()(&pq, buf,
                                                           tq_space.get_dist_func_param());
 
       // Reference full distance
-      const int8_t *qjl_signs = reinterpret_cast<const int8_t *>(buf + D);
       float dot_qjl = 0.0f;
-      for (size_t d = 0; d < D; ++d)
-        dot_qjl += pq.s_q[d] * qjl_signs[d];
+      for (size_t d = 0; d < D; ++d) {
+        float sign = (packed[d] & 1) ? 1.0f : -1.0f;
+        dot_qjl += pq.s_q[d] * sign;
+      }
       float scale = std::sqrt(static_cast<float>(M_PI) / 2.0f) /
                     std::sqrt(static_cast<float>(D));
       float correction = scale * gamma * dot_qjl;

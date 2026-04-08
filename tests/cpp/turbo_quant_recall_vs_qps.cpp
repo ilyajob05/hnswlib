@@ -266,7 +266,7 @@ static void benchmarkL2(const std::string &tag,
 
   hnswlib::HierarchicalNSW<float> hnsw(&l2space, N, M, ef_construction);
   hnsw.addPoint(base_data[0].data(), 0);
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(static, 16)
   for (int i = 1; i < static_cast<int>(N); ++i)
     hnsw.addPoint(base_data[i].data(), static_cast<size_t>(i));
 
@@ -321,7 +321,7 @@ static void benchmarkTQ(const std::string &tag,
 
   // Parallel encode (encodeVector is stateless)
   std::vector<std::vector<char>> codes(N, std::vector<char>(code_size));
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(static, 16)
   for (int i = 0; i < static_cast<int>(N); ++i)
     tqspace.encodeVector(base_data[i].data(), codes[i].data());
 
@@ -338,7 +338,7 @@ static void benchmarkTQ(const std::string &tag,
 
   hnswlib::HierarchicalNSW<float> hnsw(&tqspace, N, M, ef_construction);
   hnsw.addPoint(codes[0].data(), 0);
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(static, 16)
   for (int i = 1; i < static_cast<int>(N); ++i)
     hnsw.addPoint(codes[i].data(), static_cast<size_t>(i));
 
@@ -407,7 +407,7 @@ static void benchmarkL2GraphTQ(const std::string &tag,
 
   hnswlib::HierarchicalNSW<float> hnsw(&l2space, N, M, ef_construction);
   hnsw.addPoint(base_data[0].data(), 0);
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(static, 16)
   for (int i = 1; i < static_cast<int>(N); ++i)
     hnsw.addPoint(base_data[i].data(), static_cast<size_t>(i));
 
@@ -484,7 +484,7 @@ static void benchmarkTQRerank(const std::string &tag,
 
   // Parallel encode
   std::vector<std::vector<char>> codes(N, std::vector<char>(code_size));
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(static, 16)
   for (int i = 0; i < static_cast<int>(N); ++i)
     tqspace.encodeVector(base_data[i].data(), codes[i].data());
 
@@ -498,7 +498,7 @@ static void benchmarkTQRerank(const std::string &tag,
 
   hnswlib::HierarchicalNSW<float> hnsw(&tqspace, N, M, ef_construction);
   hnsw.addPoint(codes[0].data(), 0);
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(static, 16)
   for (int i = 1; i < static_cast<int>(N); ++i)
     hnsw.addPoint(codes[i].data(), static_cast<size_t>(i));
 
