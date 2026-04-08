@@ -23,6 +23,8 @@
 #define USE_AVX512
 #endif
 #endif
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#define USE_NEON
 #endif
 #endif
 
@@ -120,6 +122,16 @@ static bool AVX512Capable() {
     }
     return HW_AVX512F && avx512Supported;
 }
+#endif
+
+#if defined(USE_NEON)
+#include <arm_neon.h>
+#ifndef PORTABLE_ALIGN32
+#define PORTABLE_ALIGN32 __attribute__((aligned(32)))
+#endif
+#ifndef PORTABLE_ALIGN64
+#define PORTABLE_ALIGN64 __attribute__((aligned(64)))
+#endif
 #endif
 
 #include <queue>

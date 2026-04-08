@@ -60,6 +60,75 @@ namespace turboquant {
 //   to searchKnn. No shared mutable state.
 // ===========================================================================
 
+// Forward declaration
+class TurboQuantSpace;
+
+// -- Function pointer types for SIMD dispatch --------------------------------
+typedef float (*TQDistSearchFunc)(const TurboQuantPreparedQuery *pq,
+                                   const char *code_buf,
+                                   const TurboQuantSpace *space);
+
+// ===========================================================================
+// Scalar fallback implementations
+// ===========================================================================
+
+static float
+distSearchScalar(const TurboQuantPreparedQuery *pq,
+                 const char *code_buf,
+                 const TurboQuantSpace *space);
+
+static float
+distBuildScalar(const void *pVect1, const void *pVect2,
+                const void *param_ptr);
+
+// ===========================================================================
+// NEON implementations (ARM, 4 floats per iteration)
+// ===========================================================================
+#if defined(USE_NEON)
+
+static float
+distSearchNEON(const TurboQuantPreparedQuery *pq,
+               const char *code_buf,
+               const TurboQuantSpace *space);
+
+static float
+distBuildNEON(const void *pVect1, const void *pVect2,
+              const void *param_ptr);
+
+#endif // USE_NEON
+
+// ===========================================================================
+// SSE implementations
+// ===========================================================================
+#if defined(USE_SSE)
+
+static float
+distSearchSSE(const TurboQuantPreparedQuery *pq,
+              const char *code_buf,
+              const TurboQuantSpace *space);
+
+static float
+distBuildSSE(const void *pVect1, const void *pVect2,
+             const void *param_ptr);
+
+#endif // USE_SSE
+
+// ===========================================================================
+// AVX2 implementations
+// ===========================================================================
+#if defined(USE_AVX)
+
+static float
+distSearchAVX(const TurboQuantPreparedQuery *pq,
+              const char *code_buf,
+              const TurboQuantSpace *space);
+
+static float
+distBuildAVX(const void *pVect1, const void *pVect2,
+             const void *param_ptr);
+
+#endif // USE_AVX
+
 class TurboQuantSpace : public SpaceInterface<float> {
   TurboQuantEncoder encoder_;
   size_t dim_;
@@ -67,75 +136,24 @@ class TurboQuantSpace : public SpaceInterface<float> {
   int num_levels_;   ///< 2^mse_bits SQ centroid levels
   float scale_;      ///< √(π/2) / √d for QJL correction
 
-  // -- Static distance functions -------------------------------------------
+  TQDistSearchFunc dist_search_func_;
+  DISTFUNC<float>  dist_build_func_;
 
-  /// Asymmetric distance: pVect1 = TurboQuantPreparedQuery*, pVect2 = TQ code.
-  /// Uses precomputed LUT for SQ part, avoids per-element multiply.
-  static float distSearchImpl(const TurboQuantPreparedQuery *pq,
-                               const char *code_buf,
-                               const TurboQuantSpace *space) {
-    const size_t dim = space->dim_;
-    const uint8_t *sq_packed = reinterpret_cast<const uint8_t *>(code_buf);
-    const int8_t *qjl_signs = reinterpret_cast<const int8_t *>(code_buf + dim);
-    const float *meta = reinterpret_cast<const float *>(code_buf + dim + dim);
-    const float x_norm = meta[0];
-    const float gamma = meta[1];
-    const float sigma = meta[2];
-
-    // Term 1: SQ inner product via ADC lookup table
-    float ip_mse = 0.0f;
-    const int num_levels = pq->num_levels;
-    const float *lut = pq->lut.data();
-    for (size_t i = 0; i < dim; ++i)
-      ip_mse += lut[i * num_levels + sq_packed[i]];
-    ip_mse *= sigma;
-
-    // Term 2: QJL correction
-    float dot_qjl = 0.0f;
-    for (size_t i = 0; i < dim; ++i)
-      dot_qjl += pq->s_q[i] * qjl_signs[i];
-    const float correction = space->scale_ * gamma * dot_qjl;
-
-    // L2 = ||q||² + ||x||² - 2·IP
-    const float ip = (ip_mse + correction) * x_norm * pq->q_norm;
-    return std::max(0.0f, pq->q_norm_sq + x_norm * x_norm - 2.0f * ip);
-  }
-
-  /// Build distance: both pVect1 and pVect2 are TQ codes (symmetric).
-  static float turboQuantL2Build(const void *pVect1, const void *pVect2,
-                                 const void *param_ptr) {
-    const auto *space = static_cast<const TurboQuantSpace *>(param_ptr);
-    const size_t dim = space->dim_;
-    const float *centroids = space->encoder_.centroids();
-
-    const char *buf_a = static_cast<const char *>(pVect1);
-    const char *buf_b = static_cast<const char *>(pVect2);
-
-    const uint8_t *sq_a = reinterpret_cast<const uint8_t *>(buf_a);
-    const float *meta_a = reinterpret_cast<const float *>(buf_a + dim + dim);
-    const float norm_a = meta_a[0];
-    const float sigma_a = meta_a[2];
-
-    const uint8_t *sq_b = reinterpret_cast<const uint8_t *>(buf_b);
-    const float *meta_b = reinterpret_cast<const float *>(buf_b + dim + dim);
-    const float norm_b = meta_b[0];
-    const float sigma_b = meta_b[2];
-
-    // Approximate IP in rotated space using centroids lookup
-    float ip_rot = 0.0f;
-    for (size_t i = 0; i < dim; ++i)
-      ip_rot += (centroids[sq_a[i]] * sigma_a) * (centroids[sq_b[i]] * sigma_b);
-
-    const float ip = ip_rot * norm_a * norm_b;
-    return std::max(0.0f, norm_a * norm_a + norm_b * norm_b - 2.0f * ip);
-  }
+  // -- Static HNSW wrappers ------------------------------------------------
 
   /// Search distance: pVect1 = TurboQuantPreparedQuery*, pVect2 = TQ code.
   static float turboQuantL2Search(const void *pVect1, const void *pVect2,
                                   const void *param_ptr) {
     const auto *space = static_cast<const TurboQuantSpace *>(param_ptr);
     const auto *pq = static_cast<const TurboQuantPreparedQuery *>(pVect1);
-    return distSearchImpl(pq, static_cast<const char *>(pVect2), space);
+    return space->dist_search_func_(pq, static_cast<const char *>(pVect2), space);
+  }
+
+  /// Build distance: both pVect1 and pVect2 are TQ codes (symmetric).
+  static float turboQuantL2Build(const void *pVect1, const void *pVect2,
+                                 const void *param_ptr) {
+    const auto *space = static_cast<const TurboQuantSpace *>(param_ptr);
+    return space->dist_build_func_(pVect1, pVect2, param_ptr);
   }
 
 public:
@@ -145,10 +163,24 @@ public:
         code_size_(dim + dim + sizeof(float) * 3),
         num_levels_(1 << (bits_per_coord - 1)),
         scale_(std::sqrtf(static_cast<float>(M_PI) / 2.0f) /
-               std::sqrtf(static_cast<float>(dim))) {
+               std::sqrtf(static_cast<float>(dim))),
+        dist_search_func_(distSearchScalar),
+        dist_build_func_(distBuildScalar) {
     assert(dim >= 4 && "TurboQuantSpace: dim must be at least 4");
     assert((dim & (dim - 1)) == 0 &&
            "TurboQuantSpace: dim must be a power of 2");
+
+    // Runtime SIMD dispatch
+#if defined(USE_AVX)
+    dist_search_func_ = distSearchAVX;
+    dist_build_func_ = distBuildAVX;
+#elif defined(USE_NEON)
+    dist_search_func_ = distSearchNEON;
+    dist_build_func_ = distBuildNEON;
+#elif defined(USE_SSE)
+    dist_search_func_ = distSearchSSE;
+    dist_build_func_ = distBuildSSE;
+#endif
   }
 
   // -- SpaceInterface -------------------------------------------------------
@@ -215,15 +247,8 @@ public:
       pq.q_rot[i] = raw_query[i] * q_inv;
     randomizedHadamard(pq.q_rot.data(), encoder_.rotationSigns(), d);
 
-    // ADC lookup table: lut[i * num_levels + j] = q_rot[i] * centroids[j]
-    pq.num_levels = num_levels_;
-    pq.lut.resize(d * num_levels_);
-    const float *centroids = encoder_.centroids();
-    for (size_t i = 0; i < d; ++i) {
-      for (int j = 0; j < num_levels_; ++j) {
-        pq.lut[i * num_levels_ + j] = pq.q_rot[i] * centroids[j];
-      }
-    }
+    // Store centroids pointer for direct compute in distSearch
+    pq.centroids = encoder_.centroids();
 
     // QJL projection of query for correction term
     pq.s_q = pq.q_rot;
@@ -232,6 +257,519 @@ public:
     return pq;
   }
 };
+
+// ===========================================================================
+// Distance function implementations (scalar + SIMD)
+//
+// Defined after TurboQuantSpace so they can access its members.
+// Each variant has the same signature; the constructor selects one at runtime.
+// ===========================================================================
+
+// -- helpers for reading dim/scale from TurboQuantSpace ---------------------
+// (avoid friend declarations; these are trivially inlineable)
+
+inline size_t tqsDim(const TurboQuantSpace *s) { return s->dim(); }
+inline float  tqsScale(const TurboQuantSpace *s) { return s->scale(); }
+inline const float *tqsCentroids(const TurboQuantSpace *s) {
+  return s->encoder().centroids();
+}
+
+// ---------------------------------------------------------------------------
+// Scalar fallback
+// ---------------------------------------------------------------------------
+
+static float
+distSearchScalar(const TurboQuantPreparedQuery *pq,
+                 const char *code_buf,
+                 const TurboQuantSpace *space) {
+  const size_t dim = tqsDim(space);
+  const uint8_t *sq_packed = reinterpret_cast<const uint8_t *>(code_buf);
+  const int8_t *qjl_signs = reinterpret_cast<const int8_t *>(code_buf + dim);
+  const float *meta = reinterpret_cast<const float *>(code_buf + dim + dim);
+  const float x_norm = meta[0];
+  const float gamma = meta[1];
+  const float sigma = meta[2];
+
+  // Term 1: SQ inner product via direct centroid gather
+  float ip_mse = 0.0f;
+  const float *centroids = pq->centroids;
+  const float *q_rot = pq->q_rot.data();
+  for (size_t i = 0; i < dim; ++i)
+    ip_mse += q_rot[i] * centroids[sq_packed[i]];
+  ip_mse *= sigma;
+
+  // Term 2: QJL correction
+  float dot_qjl = 0.0f;
+  for (size_t i = 0; i < dim; ++i)
+    dot_qjl += pq->s_q[i] * qjl_signs[i];
+  const float correction = tqsScale(space) * gamma * dot_qjl;
+
+  // L2 = ||q||² + ||x||² - 2·IP
+  const float ip = (ip_mse + correction) * x_norm * pq->q_norm;
+  return std::max(0.0f, pq->q_norm_sq + x_norm * x_norm - 2.0f * ip);
+}
+
+static float
+distBuildScalar(const void *pVect1, const void *pVect2,
+                const void *param_ptr) {
+  const auto *space = static_cast<const TurboQuantSpace *>(param_ptr);
+  const size_t dim = tqsDim(space);
+  const float *centroids = tqsCentroids(space);
+
+  const char *buf_a = static_cast<const char *>(pVect1);
+  const char *buf_b = static_cast<const char *>(pVect2);
+
+  const uint8_t *sq_a = reinterpret_cast<const uint8_t *>(buf_a);
+  const float *meta_a = reinterpret_cast<const float *>(buf_a + dim + dim);
+  const float norm_a = meta_a[0];
+  const float sigma_a = meta_a[2];
+
+  const uint8_t *sq_b = reinterpret_cast<const uint8_t *>(buf_b);
+  const float *meta_b = reinterpret_cast<const float *>(buf_b + dim + dim);
+  const float norm_b = meta_b[0];
+  const float sigma_b = meta_b[2];
+
+  float ip_rot = 0.0f;
+  for (size_t i = 0; i < dim; ++i)
+    ip_rot += (centroids[sq_a[i]] * sigma_a) * (centroids[sq_b[i]] * sigma_b);
+
+  const float ip = ip_rot * norm_a * norm_b;
+  return std::max(0.0f, norm_a * norm_a + norm_b * norm_b - 2.0f * ip);
+}
+
+// ---------------------------------------------------------------------------
+// NEON implementation (ARM, 4 floats per iteration)
+// ---------------------------------------------------------------------------
+#if defined(USE_NEON)
+
+static float
+distSearchNEON(const TurboQuantPreparedQuery *pq,
+               const char *code_buf,
+               const TurboQuantSpace *space) {
+  const size_t dim = tqsDim(space);
+  const uint8_t *sq_packed = reinterpret_cast<const uint8_t *>(code_buf);
+  const int8_t *qjl_signs = reinterpret_cast<const int8_t *>(code_buf + dim);
+  const float *meta = reinterpret_cast<const float *>(code_buf + dim + dim);
+  const float x_norm = meta[0];
+  const float gamma = meta[1];
+  const float sigma = meta[2];
+
+  const float *centroids = pq->centroids;
+  const float *q_rot = pq->q_rot.data();
+  const float *s_q = pq->s_q.data();
+
+  // Sign-flip mask: XOR with this flips the sign bit of a float
+  const uint32x4_t sign_bit = vdupq_n_u32(0x80000000u);
+
+  float32x4_t sum_ip0 = vdupq_n_f32(0.0f);
+  float32x4_t sum_ip1 = vdupq_n_f32(0.0f);
+  float32x4_t sum_qjl0 = vdupq_n_f32(0.0f);
+  float32x4_t sum_qjl1 = vdupq_n_f32(0.0f);
+
+  // Fused loop: centroid gather + q_rot multiply + QJL, 8 elements at a time.
+  // Centroids table is small (≤512B for q8) — fits in L1 cache.
+  size_t i = 0;
+  for (; i + 8 <= dim; i += 8) {
+    // Centroid gather: scalar load from small table, then NEON multiply with q_rot
+    float c0[4], c1[4];
+    c0[0] = centroids[sq_packed[i]];
+    c0[1] = centroids[sq_packed[i+1]];
+    c0[2] = centroids[sq_packed[i+2]];
+    c0[3] = centroids[sq_packed[i+3]];
+    c1[0] = centroids[sq_packed[i+4]];
+    c1[1] = centroids[sq_packed[i+5]];
+    c1[2] = centroids[sq_packed[i+6]];
+    c1[3] = centroids[sq_packed[i+7]];
+    sum_ip0 = vmlaq_f32(sum_ip0, vld1q_f32(q_rot + i), vld1q_f32(c0));
+    sum_ip1 = vmlaq_f32(sum_ip1, vld1q_f32(q_rot + i + 4), vld1q_f32(c1));
+
+    // QJL: load 8 int8 signs, expand to 2 × int32x4, sign-flip s_q
+    int8x8_t s8 = vld1_s8(qjl_signs + i);
+    int16x8_t s16 = vmovl_s8(s8);
+    int32x4_t s32_lo = vmovl_s16(vget_low_s16(s16));
+    int32x4_t s32_hi = vmovl_s16(vget_high_s16(s16));
+    uint32x4_t neg0 = vcltq_s32(s32_lo, vdupq_n_s32(0));
+    uint32x4_t neg1 = vcltq_s32(s32_hi, vdupq_n_s32(0));
+
+    uint32x4_t sq0 = veorq_u32(vreinterpretq_u32_f32(vld1q_f32(s_q + i)),
+                                vandq_u32(neg0, sign_bit));
+    uint32x4_t sq1 = veorq_u32(vreinterpretq_u32_f32(vld1q_f32(s_q + i + 4)),
+                                vandq_u32(neg1, sign_bit));
+    sum_qjl0 = vaddq_f32(sum_qjl0, vreinterpretq_f32_u32(sq0));
+    sum_qjl1 = vaddq_f32(sum_qjl1, vreinterpretq_f32_u32(sq1));
+  }
+
+  // Handle remaining 4 elements (dim is power of 2 ≥ 4, so at most one group)
+  for (; i + 4 <= dim; i += 4) {
+    float cv[4];
+    cv[0] = centroids[sq_packed[i]];
+    cv[1] = centroids[sq_packed[i+1]];
+    cv[2] = centroids[sq_packed[i+2]];
+    cv[3] = centroids[sq_packed[i+3]];
+    sum_ip0 = vmlaq_f32(sum_ip0, vld1q_f32(q_rot + i), vld1q_f32(cv));
+
+    int8x8_t s8 = vld1_s8(qjl_signs + i);
+    int16x8_t s16 = vmovl_s8(s8);
+    int32x4_t s32 = vmovl_s16(vget_low_s16(s16));
+    uint32x4_t neg = vcltq_s32(s32, vdupq_n_s32(0));
+    uint32x4_t sq_v = veorq_u32(vreinterpretq_u32_f32(vld1q_f32(s_q + i)),
+                                 vandq_u32(neg, sign_bit));
+    sum_qjl0 = vaddq_f32(sum_qjl0, vreinterpretq_f32_u32(sq_v));
+  }
+
+  // Horizontal sum (merge two accumulators first, then reduce)
+  float ip_mse = vaddvq_f32(vaddq_f32(sum_ip0, sum_ip1)) * sigma;
+  float dot_qjl = vaddvq_f32(vaddq_f32(sum_qjl0, sum_qjl1));
+
+  const float correction = tqsScale(space) * gamma * dot_qjl;
+  const float ip = (ip_mse + correction) * x_norm * pq->q_norm;
+  return std::max(0.0f, pq->q_norm_sq + x_norm * x_norm - 2.0f * ip);
+}
+
+static float
+distBuildNEON(const void *pVect1, const void *pVect2,
+              const void *param_ptr) {
+  const auto *space = static_cast<const TurboQuantSpace *>(param_ptr);
+  const size_t dim = tqsDim(space);
+  const float *centroids = tqsCentroids(space);
+
+  const char *buf_a = static_cast<const char *>(pVect1);
+  const char *buf_b = static_cast<const char *>(pVect2);
+
+  const uint8_t *sq_a = reinterpret_cast<const uint8_t *>(buf_a);
+  const float *meta_a = reinterpret_cast<const float *>(buf_a + dim + dim);
+  const float norm_a = meta_a[0];
+  const float sigma_a = meta_a[2];
+
+  const uint8_t *sq_b = reinterpret_cast<const uint8_t *>(buf_b);
+  const float *meta_b = reinterpret_cast<const float *>(buf_b + dim + dim);
+  const float norm_b = meta_b[0];
+  const float sigma_b = meta_b[2];
+
+  const float32x4_t v_sigma_a = vdupq_n_f32(sigma_a);
+  const float32x4_t v_sigma_b = vdupq_n_f32(sigma_b);
+  float32x4_t sum = vdupq_n_f32(0.0f);
+
+  size_t i = 0;
+  for (; i + 4 <= dim; i += 4) {
+    // Scalar gather from centroids table (NEON has no gather)
+    float ca[4], cb[4];
+    ca[0] = centroids[sq_a[i]];     cb[0] = centroids[sq_b[i]];
+    ca[1] = centroids[sq_a[i + 1]]; cb[1] = centroids[sq_b[i + 1]];
+    ca[2] = centroids[sq_a[i + 2]]; cb[2] = centroids[sq_b[i + 2]];
+    ca[3] = centroids[sq_a[i + 3]]; cb[3] = centroids[sq_b[i + 3]];
+
+    float32x4_t va = vmulq_f32(vld1q_f32(ca), v_sigma_a);
+    float32x4_t vb = vmulq_f32(vld1q_f32(cb), v_sigma_b);
+    sum = vmlaq_f32(sum, va, vb);  // fused multiply-add
+  }
+
+  float ip_rot = vaddvq_f32(sum);
+
+  for (; i < dim; ++i)
+    ip_rot += (centroids[sq_a[i]] * sigma_a) * (centroids[sq_b[i]] * sigma_b);
+
+  const float ip = ip_rot * norm_a * norm_b;
+  return std::max(0.0f, norm_a * norm_a + norm_b * norm_b - 2.0f * ip);
+}
+
+#endif // USE_NEON
+
+// ---------------------------------------------------------------------------
+// SSE implementation (4 floats per iteration)
+// ---------------------------------------------------------------------------
+#if defined(USE_SSE)
+
+static float
+distSearchSSE(const TurboQuantPreparedQuery *pq,
+              const char *code_buf,
+              const TurboQuantSpace *space) {
+  const size_t dim = tqsDim(space);
+  const uint8_t *sq_packed = reinterpret_cast<const uint8_t *>(code_buf);
+  const int8_t *qjl_signs = reinterpret_cast<const int8_t *>(code_buf + dim);
+  const float *meta = reinterpret_cast<const float *>(code_buf + dim + dim);
+  const float x_norm = meta[0];
+  const float gamma = meta[1];
+  const float sigma = meta[2];
+
+  const float *centroids = pq->centroids;
+  const float *q_rot = pq->q_rot.data();
+  const float *s_q = pq->s_q.data();
+
+  // Sign-flip mask: XOR with this flips the sign bit of a float
+  const __m128i sign_bit = _mm_set1_epi32(static_cast<int>(0x80000000u));
+  const __m128i zero_i8 = _mm_setzero_si128();
+
+  __m128 sum_ip = _mm_setzero_ps();
+  __m128 sum_qjl = _mm_setzero_ps();
+
+  size_t i = 0;
+  for (; i + 4 <= dim; i += 4) {
+    // Centroid gather + multiply with q_rot
+    float cv[4];
+    cv[0] = centroids[sq_packed[i]];
+    cv[1] = centroids[sq_packed[i + 1]];
+    cv[2] = centroids[sq_packed[i + 2]];
+    cv[3] = centroids[sq_packed[i + 3]];
+    sum_ip = _mm_add_ps(sum_ip, _mm_mul_ps(_mm_loadu_ps(q_rot + i), _mm_loadu_ps(cv)));
+
+    // QJL: load 4 float s_q values
+    __m128 vsq = _mm_loadu_ps(s_q + i);
+
+    // Load 4 int8 signs, expand to 32-bit, compare < 0 to get mask
+    __m128i signs_i8 = _mm_cvtsi32_si128(*reinterpret_cast<const int32_t *>(qjl_signs + i));
+    signs_i8 = _mm_unpacklo_epi8(signs_i8, signs_i8);   // expand to 16-bit
+    signs_i8 = _mm_unpacklo_epi16(signs_i8, signs_i8);   // expand to 32-bit
+    __m128i neg_mask = _mm_cmplt_epi32(signs_i8, zero_i8);
+
+    // If sign is -1, XOR the float to flip its sign; otherwise keep as is
+    __m128i vsq_i = _mm_castps_si128(vsq);
+    vsq_i = _mm_xor_si128(vsq_i, _mm_and_si128(neg_mask, sign_bit));
+    sum_qjl = _mm_add_ps(sum_qjl, _mm_castsi128_ps(vsq_i));
+  }
+
+  // Horizontal sum
+  float PORTABLE_ALIGN32 tmp[4];
+
+  _mm_store_ps(tmp, sum_ip);
+  float ip_mse = (tmp[0] + tmp[1] + tmp[2] + tmp[3]) * sigma;
+
+  _mm_store_ps(tmp, sum_qjl);
+  float dot_qjl = tmp[0] + tmp[1] + tmp[2] + tmp[3];
+
+  // Scalar tail (dim is power of 2, ≥ 4, so this shouldn't execute)
+  for (; i < dim; ++i) {
+    ip_mse += q_rot[i] * centroids[sq_packed[i]] * sigma;
+    dot_qjl += s_q[i] * qjl_signs[i];
+  }
+
+  const float correction = tqsScale(space) * gamma * dot_qjl;
+  const float ip = (ip_mse + correction) * x_norm * pq->q_norm;
+  return std::max(0.0f, pq->q_norm_sq + x_norm * x_norm - 2.0f * ip);
+}
+
+static float
+distBuildSSE(const void *pVect1, const void *pVect2,
+             const void *param_ptr) {
+  const auto *space = static_cast<const TurboQuantSpace *>(param_ptr);
+  const size_t dim = tqsDim(space);
+  const float *centroids = tqsCentroids(space);
+
+  const char *buf_a = static_cast<const char *>(pVect1);
+  const char *buf_b = static_cast<const char *>(pVect2);
+
+  const uint8_t *sq_a = reinterpret_cast<const uint8_t *>(buf_a);
+  const float *meta_a = reinterpret_cast<const float *>(buf_a + dim + dim);
+  const float norm_a = meta_a[0];
+  const float sigma_a = meta_a[2];
+
+  const uint8_t *sq_b = reinterpret_cast<const uint8_t *>(buf_b);
+  const float *meta_b = reinterpret_cast<const float *>(buf_b + dim + dim);
+  const float norm_b = meta_b[0];
+  const float sigma_b = meta_b[2];
+
+  const __m128 v_sigma_a = _mm_set1_ps(sigma_a);
+  const __m128 v_sigma_b = _mm_set1_ps(sigma_b);
+  __m128 sum = _mm_setzero_ps();
+
+  size_t i = 0;
+  for (; i + 4 <= dim; i += 4) {
+    // Scalar gather from centroids table (SSE has no gather)
+    float ca[4], cb[4];
+    ca[0] = centroids[sq_a[i]];     cb[0] = centroids[sq_b[i]];
+    ca[1] = centroids[sq_a[i + 1]]; cb[1] = centroids[sq_b[i + 1]];
+    ca[2] = centroids[sq_a[i + 2]]; cb[2] = centroids[sq_b[i + 2]];
+    ca[3] = centroids[sq_a[i + 3]]; cb[3] = centroids[sq_b[i + 3]];
+
+    __m128 va = _mm_mul_ps(_mm_loadu_ps(ca), v_sigma_a);
+    __m128 vb = _mm_mul_ps(_mm_loadu_ps(cb), v_sigma_b);
+    sum = _mm_add_ps(sum, _mm_mul_ps(va, vb));
+  }
+
+  float PORTABLE_ALIGN32 tmp[4];
+  _mm_store_ps(tmp, sum);
+  float ip_rot = tmp[0] + tmp[1] + tmp[2] + tmp[3];
+
+  for (; i < dim; ++i)
+    ip_rot += (centroids[sq_a[i]] * sigma_a) * (centroids[sq_b[i]] * sigma_b);
+
+  const float ip = ip_rot * norm_a * norm_b;
+  return std::max(0.0f, norm_a * norm_a + norm_b * norm_b - 2.0f * ip);
+}
+
+#endif // USE_SSE
+
+// ---------------------------------------------------------------------------
+// AVX2 implementation (8 floats per iteration, uses gather)
+// ---------------------------------------------------------------------------
+#if defined(USE_AVX)
+
+static float
+distSearchAVX(const TurboQuantPreparedQuery *pq,
+              const char *code_buf,
+              const TurboQuantSpace *space) {
+  const size_t dim = tqsDim(space);
+  const uint8_t *sq_packed = reinterpret_cast<const uint8_t *>(code_buf);
+  const int8_t *qjl_signs = reinterpret_cast<const int8_t *>(code_buf + dim);
+  const float *meta = reinterpret_cast<const float *>(code_buf + dim + dim);
+  const float x_norm = meta[0];
+  const float gamma = meta[1];
+  const float sigma = meta[2];
+
+  const float *centroids = pq->centroids;
+  const float *q_rot = pq->q_rot.data();
+  const float *s_q = pq->s_q.data();
+
+  const __m256i sign_bit = _mm256_set1_epi32(static_cast<int>(0x80000000u));
+  const __m256i zero_i8 = _mm256_setzero_si256();
+
+  __m256 sum_ip = _mm256_setzero_ps();
+  __m256 sum_qjl = _mm256_setzero_ps();
+
+  size_t i = 0;
+  for (; i + 8 <= dim; i += 8) {
+    // Centroid gather from small table + multiply with q_rot
+#ifdef __AVX2__
+    __m256i idx = _mm256_set_epi32(
+        sq_packed[i+7], sq_packed[i+6], sq_packed[i+5], sq_packed[i+4],
+        sq_packed[i+3], sq_packed[i+2], sq_packed[i+1], sq_packed[i]);
+    __m256 vc = _mm256_i32gather_ps(centroids, idx, 4);
+#else
+    __m256 vc = _mm256_set_ps(
+        centroids[sq_packed[i+7]], centroids[sq_packed[i+6]],
+        centroids[sq_packed[i+5]], centroids[sq_packed[i+4]],
+        centroids[sq_packed[i+3]], centroids[sq_packed[i+2]],
+        centroids[sq_packed[i+1]], centroids[sq_packed[i]]);
+#endif
+    sum_ip = _mm256_add_ps(sum_ip, _mm256_mul_ps(_mm256_loadu_ps(q_rot + i), vc));
+
+    // QJL: load 8 floats from s_q, sign-flip based on qjl_signs
+    __m256 vsq = _mm256_loadu_ps(s_q + i);
+
+    int64_t signs_raw;
+    std::memcpy(&signs_raw, qjl_signs + i, 8);
+    __m128i signs_i8 = _mm_set1_epi64x(signs_raw);
+
+#ifdef __AVX2__
+    __m256i signs_i32 = _mm256_cvtepi8_epi32(signs_i8);
+    __m256i neg_mask = _mm256_cmpgt_epi32(zero_i8, signs_i32);
+#else
+    __m128i lo8 = signs_i8;
+    __m128i lo16 = _mm_unpacklo_epi8(lo8, lo8);
+    __m128i lo_lo32 = _mm_unpacklo_epi16(lo16, lo16);
+    __m128i lo_hi32 = _mm_unpackhi_epi16(lo16, lo16);
+    lo_lo32 = _mm_srai_epi32(lo_lo32, 24);
+    lo_hi32 = _mm_srai_epi32(lo_hi32, 24);
+    __m256i signs_i32 = _mm256_insertf128_si256(
+        _mm256_castsi128_si256(lo_lo32), lo_hi32, 1);
+    __m256i neg_mask = _mm256_castps_si256(
+        _mm256_cmp_ps(_mm256_castsi256_ps(signs_i32),
+                      _mm256_setzero_ps(), _CMP_LT_OQ));
+#endif
+
+    __m256i vsq_i = _mm256_castps_si256(vsq);
+    vsq_i = _mm256_xor_si256(vsq_i, _mm256_and_si256(neg_mask, sign_bit));
+    sum_qjl = _mm256_add_ps(sum_qjl, _mm256_castsi256_ps(vsq_i));
+  }
+
+  // Horizontal sum (AVX → 128-bit halves → scalar)
+  __m128 hi_ip = _mm256_extractf128_ps(sum_ip, 1);
+  __m128 lo_ip = _mm256_castps256_ps128(sum_ip);
+  __m128 s_ip = _mm_add_ps(lo_ip, hi_ip);
+  s_ip = _mm_add_ps(s_ip, _mm_movehl_ps(s_ip, s_ip));
+  s_ip = _mm_add_ss(s_ip, _mm_shuffle_ps(s_ip, s_ip, 1));
+  float ip_mse = _mm_cvtss_f32(s_ip) * sigma;
+
+  __m128 hi_qjl = _mm256_extractf128_ps(sum_qjl, 1);
+  __m128 lo_qjl = _mm256_castps256_ps128(sum_qjl);
+  __m128 s_qjl = _mm_add_ps(lo_qjl, hi_qjl);
+  s_qjl = _mm_add_ps(s_qjl, _mm_movehl_ps(s_qjl, s_qjl));
+  s_qjl = _mm_add_ss(s_qjl, _mm_shuffle_ps(s_qjl, s_qjl, 1));
+  float dot_qjl = _mm_cvtss_f32(s_qjl);
+
+  // Scalar tail
+  for (; i < dim; ++i) {
+    ip_mse += q_rot[i] * centroids[sq_packed[i]] * sigma;
+    dot_qjl += s_q[i] * qjl_signs[i];
+  }
+
+  const float correction = tqsScale(space) * gamma * dot_qjl;
+  const float ip = (ip_mse + correction) * x_norm * pq->q_norm;
+  return std::max(0.0f, pq->q_norm_sq + x_norm * x_norm - 2.0f * ip);
+}
+
+static float
+distBuildAVX(const void *pVect1, const void *pVect2,
+             const void *param_ptr) {
+  const auto *space = static_cast<const TurboQuantSpace *>(param_ptr);
+  const size_t dim = tqsDim(space);
+  const float *centroids = tqsCentroids(space);
+
+  const char *buf_a = static_cast<const char *>(pVect1);
+  const char *buf_b = static_cast<const char *>(pVect2);
+
+  const uint8_t *sq_a = reinterpret_cast<const uint8_t *>(buf_a);
+  const float *meta_a = reinterpret_cast<const float *>(buf_a + dim + dim);
+  const float norm_a = meta_a[0];
+  const float sigma_a = meta_a[2];
+
+  const uint8_t *sq_b = reinterpret_cast<const uint8_t *>(buf_b);
+  const float *meta_b = reinterpret_cast<const float *>(buf_b + dim + dim);
+  const float norm_b = meta_b[0];
+  const float sigma_b = meta_b[2];
+
+  const __m256 v_sigma_a = _mm256_set1_ps(sigma_a);
+  const __m256 v_sigma_b = _mm256_set1_ps(sigma_b);
+  __m256 sum = _mm256_setzero_ps();
+
+  size_t i = 0;
+  for (; i + 8 <= dim; i += 8) {
+#ifdef __AVX2__
+    // Gather centroids for vector A
+    __m256i idx_a = _mm256_set_epi32(
+        sq_a[i + 7], sq_a[i + 6], sq_a[i + 5], sq_a[i + 4],
+        sq_a[i + 3], sq_a[i + 2], sq_a[i + 1], sq_a[i]);
+    __m256 va = _mm256_mul_ps(_mm256_i32gather_ps(centroids, idx_a, 4), v_sigma_a);
+
+    // Gather centroids for vector B
+    __m256i idx_b = _mm256_set_epi32(
+        sq_b[i + 7], sq_b[i + 6], sq_b[i + 5], sq_b[i + 4],
+        sq_b[i + 3], sq_b[i + 2], sq_b[i + 1], sq_b[i]);
+    __m256 vb = _mm256_mul_ps(_mm256_i32gather_ps(centroids, idx_b, 4), v_sigma_b);
+#else
+    // AVX without AVX2: scalar gather + pack
+    __m256 va = _mm256_mul_ps(
+        _mm256_set_ps(centroids[sq_a[i+7]], centroids[sq_a[i+6]],
+                      centroids[sq_a[i+5]], centroids[sq_a[i+4]],
+                      centroids[sq_a[i+3]], centroids[sq_a[i+2]],
+                      centroids[sq_a[i+1]], centroids[sq_a[i]]),
+        v_sigma_a);
+    __m256 vb = _mm256_mul_ps(
+        _mm256_set_ps(centroids[sq_b[i+7]], centroids[sq_b[i+6]],
+                      centroids[sq_b[i+5]], centroids[sq_b[i+4]],
+                      centroids[sq_b[i+3]], centroids[sq_b[i+2]],
+                      centroids[sq_b[i+1]], centroids[sq_b[i]]),
+        v_sigma_b);
+#endif
+    sum = _mm256_add_ps(sum, _mm256_mul_ps(va, vb));
+  }
+
+  // Horizontal sum
+  __m128 hi = _mm256_extractf128_ps(sum, 1);
+  __m128 lo = _mm256_castps256_ps128(sum);
+  __m128 s = _mm_add_ps(lo, hi);
+  s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+  s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+  float ip_rot = _mm_cvtss_f32(s);
+
+  for (; i < dim; ++i)
+    ip_rot += (centroids[sq_a[i]] * sigma_a) * (centroids[sq_b[i]] * sigma_b);
+
+  const float ip = ip_rot * norm_a * norm_b;
+  return std::max(0.0f, norm_a * norm_a + norm_b * norm_b - 2.0f * ip);
+}
+
+#endif // USE_AVX
 
 // ===========================================================================
 // Compress/Save/Load utilities

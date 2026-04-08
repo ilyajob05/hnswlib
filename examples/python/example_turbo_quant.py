@@ -17,10 +17,10 @@ Key parameters:
     Default (0) = use current ef value.
 """
 
-dim = 128
+dim = 512
 num_elements = 1000000
-num_queries = 1000
-k = 100
+num_queries = 100
+k = 10
 ef = 200            # same ef for fair comparison between L2 and TQ
 rerank_ef = 200     # candidates to re-rank (>= ef for best results)
 M = 16
@@ -116,5 +116,5 @@ print(f"\nMemory: {tq.code_size} B/vec TQ vs {dim*4} B/vec L2 "
 
 # Cleanup
 del tq
-# os.remove(index_path)
-# os.remove(raw_path)
+os.remove(index_path)
+os.remove(raw_path)

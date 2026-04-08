@@ -1133,11 +1133,9 @@ bool test_lut_correctness(int bits_per_coord = 4) {
     tq_space.encodeVector(embeddings[i].data(), codes[i].data());
   }
 
-  // Reference: compute distance using direct formula (no LUT)
+  // Reference: compute distance using direct formula
   // ip_mse_ref = sigma * Σ_i q_rot[i] * centroids[sq_packed[i]]
-  const auto &lm_table = hnswlib::turboquant::detail::computeLloydMax(mse_bits);
-  const float *centroids = lm_table.centroids.data();
-  const int num_levels = 1 << mse_bits;
+  const float *centroids = tq_space.encoder().centroids();
 
   float max_rel_err = 0.0f;
   int mismatches = 0;
@@ -1154,29 +1152,14 @@ bool test_lut_correctness(int bits_per_coord = 4) {
       const float gamma = meta[1];
       const float sigma = meta[2];
 
-      // Reference MSE term (no LUT)
+      // Reference MSE term (direct compute)
       float ip_mse_ref = 0.0f;
       for (size_t d = 0; d < D; ++d)
         ip_mse_ref += pq.q_rot[d] * centroids[sq_packed[d]] * sigma;
 
-      // LUT MSE term
-      float ip_mse_lut = 0.0f;
-      const float *lut = pq.lut.data();
-      for (size_t d = 0; d < D; ++d)
-        ip_mse_lut += lut[d * num_levels + sq_packed[d]];
-      ip_mse_lut *= sigma;
-
-      float abs_err = std::abs(ip_mse_ref - ip_mse_lut);
-      float denom = std::max(std::abs(ip_mse_ref), 1e-10f);
-      float rel_err = abs_err / denom;
-      if (rel_err > max_rel_err)
-        max_rel_err = rel_err;
-      if (rel_err > TOL)
-        ++mismatches;
-
-      // Also verify full distance via TurboQuantSpace search dispatch
-      float dist_lut = tq_space.getSearchDistFunc()(&pq, buf,
-                                                     tq_space.get_dist_func_param());
+      // Verify full distance via TurboQuantSpace search dispatch
+      float dist_dispatch = tq_space.getSearchDistFunc()(&pq, buf,
+                                                          tq_space.get_dist_func_param());
 
       // Reference full distance
       const int8_t *qjl_signs = reinterpret_cast<const int8_t *>(buf + D);
@@ -1190,17 +1173,20 @@ bool test_lut_correctness(int bits_per_coord = 4) {
       float dist_ref =
           std::max(0.0f, pq.q_norm_sq + x_norm * x_norm - 2.0f * ip_ref);
 
-      float dist_err = std::abs(dist_lut - dist_ref);
+      float dist_err = std::abs(dist_dispatch - dist_ref);
       float dist_denom = std::max(dist_ref, 1e-10f);
-      if (dist_err / dist_denom > TOL)
+      float rel_err = dist_err / dist_denom;
+      if (rel_err > max_rel_err)
+        max_rel_err = rel_err;
+      if (rel_err > TOL)
         ++mismatches;
     }
   }
 
   bool pass = (mismatches == 0);
-  std::cout << "  Max relative error (MSE term): " << std::scientific
+  std::cout << "  Max relative error (distance): " << std::scientific
             << max_rel_err << std::endl;
-  std::cout << "  Mismatches: " << mismatches << " / " << (NUM_QUERIES * N * 2)
+  std::cout << "  Mismatches: " << mismatches << " / " << (NUM_QUERIES * N)
             << std::endl;
   std::cout << "  " << (pass ? "PASS" : "FAIL") << std::endl;
   return pass;

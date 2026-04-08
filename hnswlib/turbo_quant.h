@@ -105,11 +105,8 @@ public:
   }
 };
 
-// Walsh-Hadamard Transform (WHT)
-inline void whtInplace(float *data, size_t const d) {
-  assert(d > 0 && (d & (d - 1)) == 0 &&
-         "whtInplace: d must be a positive power of 2");
-
+// Walsh-Hadamard Transform (WHT) — scalar fallback
+inline void whtInplaceScalar(float *data, size_t const d) {
   for (size_t step = 1; step < d; step <<= 1) {
     const size_t jump = step << 1;
     for (size_t i = 0; i < d; i += jump) {
@@ -123,11 +120,142 @@ inline void whtInplace(float *data, size_t const d) {
       }
     }
   }
+}
 
-  float norm = 1.0f / std::sqrt(static_cast<float>(d));
-  for (size_t i = 0; i < d; ++i) {
-    data[i] *= norm;
+#if defined(USE_AVX)
+inline void whtInplaceAVX(float *data, size_t const d) {
+  // Small steps (< 8): scalar butterfly
+  for (size_t step = 1; step < 8 && step < d; step <<= 1) {
+    const size_t jump = step << 1;
+    for (size_t i = 0; i < d; i += jump) {
+      float *__restrict__ low = &data[i];
+      float *__restrict__ high = &data[i + step];
+      for (size_t j = 0; j < step; ++j) {
+        float a = low[j];
+        float b = high[j];
+        low[j] = a + b;
+        high[j] = a - b;
+      }
+    }
   }
+  // Large steps (>= 8): AVX butterfly, 8 floats at a time
+  for (size_t step = 8; step < d; step <<= 1) {
+    const size_t jump = step << 1;
+    for (size_t i = 0; i < d; i += jump) {
+      float *__restrict__ low = &data[i];
+      float *__restrict__ high = &data[i + step];
+      for (size_t j = 0; j < step; j += 8) {
+        __m256 a = _mm256_loadu_ps(low + j);
+        __m256 b = _mm256_loadu_ps(high + j);
+        _mm256_storeu_ps(low + j, _mm256_add_ps(a, b));
+        _mm256_storeu_ps(high + j, _mm256_sub_ps(a, b));
+      }
+    }
+  }
+}
+#elif defined(USE_NEON)
+inline void whtInplaceNEON(float *data, size_t const d) {
+  // Small steps (< 4): scalar butterfly
+  for (size_t step = 1; step < 4 && step < d; step <<= 1) {
+    const size_t jump = step << 1;
+    for (size_t i = 0; i < d; i += jump) {
+      float *__restrict__ low = &data[i];
+      float *__restrict__ high = &data[i + step];
+      for (size_t j = 0; j < step; ++j) {
+        float a = low[j];
+        float b = high[j];
+        low[j] = a + b;
+        high[j] = a - b;
+      }
+    }
+  }
+  // Large steps (>= 4): NEON butterfly, 4 floats at a time
+  for (size_t step = 4; step < d; step <<= 1) {
+    const size_t jump = step << 1;
+    for (size_t i = 0; i < d; i += jump) {
+      float *__restrict__ low = &data[i];
+      float *__restrict__ high = &data[i + step];
+      for (size_t j = 0; j < step; j += 4) {
+        float32x4_t a = vld1q_f32(low + j);
+        float32x4_t b = vld1q_f32(high + j);
+        vst1q_f32(low + j, vaddq_f32(a, b));
+        vst1q_f32(high + j, vsubq_f32(a, b));
+      }
+    }
+  }
+}
+#elif defined(USE_SSE)
+inline void whtInplaceSSE(float *data, size_t const d) {
+  // Small steps (< 4): scalar butterfly
+  for (size_t step = 1; step < 4 && step < d; step <<= 1) {
+    const size_t jump = step << 1;
+    for (size_t i = 0; i < d; i += jump) {
+      float *__restrict__ low = &data[i];
+      float *__restrict__ high = &data[i + step];
+      for (size_t j = 0; j < step; ++j) {
+        float a = low[j];
+        float b = high[j];
+        low[j] = a + b;
+        high[j] = a - b;
+      }
+    }
+  }
+  // Large steps (>= 4): SSE butterfly, 4 floats at a time
+  for (size_t step = 4; step < d; step <<= 1) {
+    const size_t jump = step << 1;
+    for (size_t i = 0; i < d; i += jump) {
+      float *__restrict__ low = &data[i];
+      float *__restrict__ high = &data[i + step];
+      for (size_t j = 0; j < step; j += 4) {
+        __m128 a = _mm_loadu_ps(low + j);
+        __m128 b = _mm_loadu_ps(high + j);
+        _mm_storeu_ps(low + j, _mm_add_ps(a, b));
+        _mm_storeu_ps(high + j, _mm_sub_ps(a, b));
+      }
+    }
+  }
+}
+#endif
+
+// Walsh-Hadamard Transform (WHT)
+inline void whtInplace(float *data, size_t const d) {
+  assert(d > 0 && (d & (d - 1)) == 0 &&
+         "whtInplace: d must be a positive power of 2");
+
+#if defined(USE_AVX)
+  whtInplaceAVX(data, d);
+#elif defined(USE_NEON)
+  whtInplaceNEON(data, d);
+#elif defined(USE_SSE)
+  whtInplaceSSE(data, d);
+#else
+  whtInplaceScalar(data, d);
+#endif
+
+  // Normalize
+  float norm = 1.0f / std::sqrt(static_cast<float>(d));
+#if defined(USE_AVX)
+  {
+    __m256 vnorm = _mm256_set1_ps(norm);
+    for (size_t i = 0; i < d; i += 8)
+      _mm256_storeu_ps(data + i, _mm256_mul_ps(_mm256_loadu_ps(data + i), vnorm));
+  }
+#elif defined(USE_NEON)
+  {
+    float32x4_t vnorm = vdupq_n_f32(norm);
+    for (size_t i = 0; i < d; i += 4)
+      vst1q_f32(data + i, vmulq_f32(vld1q_f32(data + i), vnorm));
+  }
+#elif defined(USE_SSE)
+  {
+    __m128 vnorm = _mm_set1_ps(norm);
+    for (size_t i = 0; i < d; i += 4)
+      _mm_storeu_ps(data + i, _mm_mul_ps(_mm_loadu_ps(data + i), vnorm));
+  }
+#else
+  for (size_t i = 0; i < d; ++i)
+    data[i] *= norm;
+#endif
 }
 
 inline std::vector<float> generateSigns(size_t const d, uint64_t const seed) {
@@ -158,17 +286,35 @@ inline void randomizedHadamard(float *data,
   assert(d > 0 && (d & (d - 1)) == 0 &&
          "randomizedHadamard: d must be a positive power of 2");
 
+  // Elementwise multiply: data[i] *= signs[i]
   size_t i = 0;
+#if defined(USE_AVX)
+  for (; i + 8 <= d; i += 8) {
+    __m256 vd = _mm256_loadu_ps(data + i);
+    __m256 vs = _mm256_loadu_ps(signs + i);
+    _mm256_storeu_ps(data + i, _mm256_mul_ps(vd, vs));
+  }
+#elif defined(USE_NEON)
+  for (; i + 4 <= d; i += 4) {
+    float32x4_t vd = vld1q_f32(data + i);
+    float32x4_t vs = vld1q_f32(signs + i);
+    vst1q_f32(data + i, vmulq_f32(vd, vs));
+  }
+#elif defined(USE_SSE)
+  for (; i + 4 <= d; i += 4) {
+    __m128 vd = _mm_loadu_ps(data + i);
+    __m128 vs = _mm_loadu_ps(signs + i);
+    _mm_storeu_ps(data + i, _mm_mul_ps(vd, vs));
+  }
+#else
   for (; i + 64 <= d; i += 64) {
-    for (size_t j = 0; j < 64; ++j) {
+    for (size_t j = 0; j < 64; ++j)
       data[i + j] *= signs[i + j];
-    }
   }
-  if (i < d) {
-    for (size_t j = 0; i + j < d; ++j) {
-      data[i + j] *= signs[i + j];
-    }
-  }
+#endif
+  for (; i < d; ++i)
+    data[i] *= signs[i];
+
   whtInplace(data, d);
 }
 
@@ -651,11 +797,7 @@ struct TurboQuantPreparedQuery {
   float q_norm_sq;          ///< ||query||^2
   float q_norm;             ///< ||query||
 
-  /// ADC lookup table: lut[i * num_levels + j] = q_rot[i] * centroids[j].
-  /// Precomputed once per query; eliminates per-candidate multiply in
-  /// distSearch.
-  std::vector<float> lut;
-  int num_levels; ///< number of SQ centroid levels (8 or 16)
+  const float *centroids;   ///< pointer to encoder centroids (NOT owned)
 };
 
 } // namespace turboquant
