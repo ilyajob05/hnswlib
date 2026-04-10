@@ -638,6 +638,247 @@ static void benchmarkTQRerank(const std::string &tag,
 }
 
 // ---------------------------------------------------------------------------
+// Benchmark: L2 graph build + TQ search + L2 re-ranking
+// Graph topology from exact L2 on raw vectors; candidate retrieval uses
+// TQ asymmetric distance; final ordering uses exact L2 from base_data.
+// ---------------------------------------------------------------------------
+
+static void benchmarkL2GraphTQRerank(
+    const std::string &tag,
+    const std::vector<std::vector<float>> &base_data,
+    const std::vector<std::vector<float>> &queries,
+    const std::vector<std::vector<int>> &gt, size_t dim, size_t M,
+    size_t ef_construction, size_t K, const std::vector<size_t> &ef_values,
+    int bits_per_coord = 4) {
+
+  const size_t N = base_data.size();
+  TurboQuantSpace tqspace(dim, bits_per_coord, 42, 137);
+  size_t tq_code_size = tqspace.codeSizeBytes();
+  size_t l2_data_size = dim * sizeof(float);
+
+  std::string method =
+      "l2graph_tq" + std::to_string(bits_per_coord) + "_rerank";
+
+  if (tq_code_size > l2_data_size) {
+    std::cerr << "[" << tag << "] " << method << ": SKIP (TQ code "
+              << tq_code_size << " B > L2 slot " << l2_data_size << " B)"
+              << std::endl;
+    return;
+  }
+
+  std::cerr << "[" << tag << "] " << method << ": building L2 graph (" << N
+            << " vectors)..." << std::endl;
+
+  hnswlib::L2Space l2space(dim);
+  size_t rss_before = getCurrentRSS();
+  StopWatch sw;
+
+  hnswlib::HierarchicalNSW<float> hnsw(&l2space, N, M, ef_construction);
+  hnsw.addPoint(base_data[0].data(), 0);
+  ParallelFor(1, N, g_build_threads, [&](size_t i, size_t) {
+    hnsw.addPoint(base_data[i].data(), i);
+  });
+
+  double l2_build_time = sw.elapsedSeconds();
+  std::cerr << "[" << tag << "] " << method << ": L2 build: " << std::fixed
+            << std::setprecision(2) << l2_build_time << " s" << std::endl;
+
+  // Replace stored data with TQ codes
+  std::cerr << "[" << tag << "] " << method
+            << ": replacing data with TQ codes..." << std::endl;
+  sw.reset();
+  std::vector<char> code_buf(tq_code_size);
+  for (size_t i = 0; i < N; ++i) {
+    tqspace.encodeVector(base_data[i].data(), code_buf.data());
+    char *slot = hnsw.getDataByInternalId(static_cast<hnswlib::tableint>(i));
+    memset(slot, 0, l2_data_size);
+    memcpy(slot, code_buf.data(), tq_code_size);
+  }
+  double encode_time = sw.elapsedSeconds();
+  double build_time = l2_build_time + encode_time;
+
+  std::cerr << "[" << tag << "] " << method
+            << ": encode+replace: " << std::fixed << std::setprecision(2)
+            << encode_time << " s (total: " << build_time << " s)" << std::endl;
+
+  // Swap distance function to TQ asymmetric search (PreparedQuery × code).
+  tqspace.setSearchMode(hnsw);
+
+  size_t rss_after = getCurrentRSS();
+  size_t tq_mem = (rss_after > rss_before) ? (rss_after - rss_before) / N : 0;
+  size_t mem_per_vec = tq_mem + dim * sizeof(float);
+
+  // Warmup
+  {
+    hnsw.setEf(10);
+    for (size_t q = 0; q < queries.size(); ++q) {
+      auto pq = tqspace.prepareQuery(queries[q].data());
+      auto result = hnsw.searchKnn(&pq, 10);
+      (void)result;
+    }
+  }
+  std::cerr << "[" << tag << "] " << method << " warmup done" << std::endl;
+
+  // Sweep: TQ search for ef candidates, re-rank by exact L2 from base_data
+  bool first = true;
+  for (size_t ef : ef_values) {
+    hnsw.setEf(ef);
+    std::atomic<size_t> correct(0);
+    std::atomic<size_t> total(0);
+
+    sw.reset();
+    ParallelFor(0, queries.size(), g_search_threads, [&](size_t q, size_t) {
+      const float *query = queries[q].data();
+
+      auto pq = tqspace.prepareQuery(query);
+      auto tq_result = hnsw.searchKnn(&pq, ef);
+
+      std::vector<std::pair<float, hnswlib::labeltype>> shortlist;
+      shortlist.reserve(tq_result.size());
+      while (!tq_result.empty()) {
+        hnswlib::labeltype id = tq_result.top().second;
+        float dist = 0.0f;
+        const float *bv = base_data[id].data();
+        for (size_t d = 0; d < dim; ++d) {
+          float diff = query[d] - bv[d];
+          dist += diff * diff;
+        }
+        shortlist.push_back({dist, id});
+        tq_result.pop();
+      }
+      std::partial_sort(shortlist.begin(),
+                        shortlist.begin() + std::min(K, shortlist.size()),
+                        shortlist.end());
+
+      std::unordered_set<hnswlib::labeltype> gt_set;
+      for (size_t j = 0; j < K && j < gt[q].size(); ++j)
+        gt_set.insert(static_cast<hnswlib::labeltype>(gt[q][j]));
+      total.fetch_add(gt_set.size(), std::memory_order_relaxed);
+      size_t local_correct = 0;
+      for (size_t i = 0; i < K && i < shortlist.size(); ++i) {
+        if (gt_set.count(shortlist[i].second))
+          ++local_correct;
+      }
+      correct.fetch_add(local_correct, std::memory_order_relaxed);
+    });
+
+    double us_per_q = sw.elapsedSeconds() / queries.size() * 1e6;
+    float recall =
+        static_cast<float>(correct.load()) / static_cast<float>(total.load());
+    emitCSV(tag, method, ef, recall, us_per_q, build_time, mem_per_vec, first);
+    first = false;
+    std::cerr << "[" << tag << "]   ef=" << ef << ": recall=" << std::fixed
+              << std::setprecision(4) << recall << ", " << std::setprecision(1)
+              << us_per_q << " us/q" << std::endl;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark: TurboQuantIndex::buildFromL2 via the high-level API.
+// Same semantics as benchmarkL2GraphTQRerank but built through
+// initL2Build + parallel addL2Point + finalizeFromL2 + searchRerank.
+// Used to verify that the new public API produces identical numbers
+// to the hand-wired version.
+// ---------------------------------------------------------------------------
+
+static void benchmarkTQIndexBuildFromL2(
+    const std::string &tag,
+    const std::vector<std::vector<float>> &base_data,
+    const std::vector<std::vector<float>> &queries,
+    const std::vector<std::vector<int>> &gt, size_t dim, size_t M,
+    size_t ef_construction, size_t K, const std::vector<size_t> &ef_values,
+    int bits_per_coord = 4) {
+
+  const size_t N = base_data.size();
+  std::string method =
+      "tqidx_l2g_rerank" + std::to_string(bits_per_coord);
+
+  std::cerr << "[" << tag << "] " << method << ": initL2Build (" << N
+            << " vectors)..." << std::endl;
+
+  TurboQuantIndex tqidx(dim, bits_per_coord, 42, 137);
+  size_t rss_before = getCurrentRSS();
+  StopWatch sw;
+
+  tqidx.initL2Build(N, M, ef_construction);
+
+  // Flatten base_data into a contiguous buffer once — finalizeFromL2
+  // needs a single pointer, and addL2Point reads per-row.
+  std::vector<float> flat(N * dim);
+  for (size_t i = 0; i < N; ++i)
+    std::memcpy(flat.data() + i * dim, base_data[i].data(),
+                dim * sizeof(float));
+
+  // First point single-threaded (entry point).
+  tqidx.addL2Point(flat.data(), 0);
+  ParallelFor(1, N, g_build_threads, [&](size_t i, size_t) {
+    tqidx.addL2Point(flat.data() + i * dim, i);
+  });
+
+  double l2_build_time = sw.elapsedSeconds();
+  std::cerr << "[" << tag << "] " << method << ": L2 build: " << std::fixed
+            << std::setprecision(2) << l2_build_time << " s" << std::endl;
+
+  sw.reset();
+  auto status = tqidx.finalizeFromL2(flat.data(), N, /*keep_raw=*/true);
+  if (!status.ok()) {
+    std::cerr << "[" << tag << "] " << method
+              << ": finalizeFromL2 failed: " << status.message() << std::endl;
+    return;
+  }
+  double finalize_time = sw.elapsedSeconds();
+  double build_time = l2_build_time + finalize_time;
+
+  std::cerr << "[" << tag << "] " << method
+            << ": finalize: " << std::fixed << std::setprecision(2)
+            << finalize_time << " s (total: " << build_time << " s)"
+            << std::endl;
+
+  size_t rss_after = getCurrentRSS();
+  size_t mem_per_vec =
+      (rss_after > rss_before) ? (rss_after - rss_before) / N : 0;
+
+  // Warmup
+  tqidx.setEf(10);
+  for (size_t q = 0; q < queries.size(); ++q) {
+    (void)tqidx.searchRerank(queries[q].data(), 10, 10);
+  }
+  std::cerr << "[" << tag << "] " << method << " warmup done" << std::endl;
+
+  bool first = true;
+  for (size_t ef : ef_values) {
+    tqidx.setEf(ef);
+    std::atomic<size_t> correct(0);
+    std::atomic<size_t> total(0);
+
+    sw.reset();
+    ParallelFor(0, queries.size(), g_search_threads, [&](size_t q, size_t) {
+      auto shortlist = tqidx.searchRerank(queries[q].data(), K, ef);
+
+      std::unordered_set<hnswlib::labeltype> gt_set;
+      for (size_t j = 0; j < K && j < gt[q].size(); ++j)
+        gt_set.insert(static_cast<hnswlib::labeltype>(gt[q][j]));
+      total.fetch_add(gt_set.size(), std::memory_order_relaxed);
+      size_t local_correct = 0;
+      for (size_t i = 0; i < K && i < shortlist.size(); ++i) {
+        if (gt_set.count(shortlist[i].second))
+          ++local_correct;
+      }
+      correct.fetch_add(local_correct, std::memory_order_relaxed);
+    });
+
+    double us_per_q = sw.elapsedSeconds() / queries.size() * 1e6;
+    float recall =
+        static_cast<float>(correct.load()) / static_cast<float>(total.load());
+    emitCSV(tag, method, ef, recall, us_per_q, build_time, mem_per_vec, first);
+    first = false;
+    std::cerr << "[" << tag << "]   ef=" << ef << ": recall=" << std::fixed
+              << std::setprecision(4) << recall << ", " << std::setprecision(1)
+              << us_per_q << " us/q" << std::endl;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Dataset descriptor
 // ---------------------------------------------------------------------------
 
@@ -782,6 +1023,12 @@ int main(int argc, char **argv) {
 
       benchmarkTQRerank(ds.name, base_data, queries, gt, dim, M,
                         EF_CONSTRUCTION, K, ef_values, bits);
+
+      benchmarkL2GraphTQRerank(ds.name, base_data, queries, gt, dim, M,
+                               EF_CONSTRUCTION, K, ef_values, bits);
+
+      benchmarkTQIndexBuildFromL2(ds.name, base_data, queries, gt, dim, M,
+                                  EF_CONSTRUCTION, K, ef_values, bits);
     }
 
     std::cerr << "[" << ds.name << "] === Done ===" << std::endl;

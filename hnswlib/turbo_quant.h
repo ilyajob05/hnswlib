@@ -103,42 +103,66 @@ inline void randomizedHadamard(float *data,
 // ===========================================================================
 // TurboQuantCode — lightweight view over an HNSW buffer slot
 //
-// Layout: [packed: dim bytes] [meta: 12 bytes (norm, gamma, sigma)]
-//   packed[i] = (sq_idx << 1) | qjl_bit
-// Total: dim + 12 bytes per vector.
+// Layout depends on bits_per_coord:
+//   b >= 5: 1 byte/coord, packed[i] = (sq_idx << 1) | qjl_bit
+//           total = dim + 12 bytes
+//   b == 4 (3+1): 1 nibble/coord, 2 coords/byte
+//           byte[i] = (nibble[2i+1] << 4) | nibble[2i],
+//           nibble = (sq_idx << 1) | qjl_bit  (sq_idx in 0..7)
+//           total = dim/2 + 12 bytes
 //
 // Does NOT own the buffer — caller manages lifetime.
 // ===========================================================================
 
 class TurboQuantCode {
 public:
-  uint8_t *sq_packed_;  ///< points into HNSW buffer (dim bytes)
+  uint8_t *sq_packed_;  ///< points into HNSW buffer (packed region)
   float *meta_;         ///< points to meta region: [norm, gamma, sigma]
 
   TurboQuantCode() : sq_packed_(nullptr), meta_(nullptr) {}
 
   /// Wrap an existing HNSW buffer slot.
-  TurboQuantCode(void *buf, size_t dim)
+  TurboQuantCode(void *buf, size_t dim, int bits_per_coord = 8)
       : sq_packed_(reinterpret_cast<uint8_t *>(buf)),
-        meta_(reinterpret_cast<float *>(static_cast<char *>(buf) + dim)) {}
+        meta_(reinterpret_cast<float *>(
+            static_cast<char *>(buf) + packedBytes(dim, bits_per_coord))) {}
 
   /// Const version for read-only access.
-  TurboQuantCode(const void *buf, size_t dim)
+  TurboQuantCode(const void *buf, size_t dim, int bits_per_coord = 8)
       : sq_packed_(const_cast<uint8_t *>(
             reinterpret_cast<const uint8_t *>(buf))),
         meta_(const_cast<float *>(
             reinterpret_cast<const float *>(
-                static_cast<const char *>(buf) + dim))) {}
+                static_cast<const char *>(buf) +
+                packedBytes(dim, bits_per_coord)))) {}
 
-  // -- Packed byte accessors ------------------------------------------------
-
-  inline void set(size_t i, uint8_t sq_idx, bool qjl_positive) {
-    sq_packed_[i] = (sq_idx << 1) | static_cast<uint8_t>(qjl_positive);
-  }
+  // -- Packed unit accessors ------------------------------------------------
+  //
+  // These work for the full-byte layout (b>=5). For packed-nibble layout
+  // (b<=4), use the variants that take bits_per_coord or call the
+  // space-level helpers directly.
 
   inline uint8_t sqIndex(size_t i) const { return sq_packed_[i] >> 1; }
-
   inline bool qjlSign(size_t i) const { return sq_packed_[i] & 1; }
+  inline void set(size_t i, uint8_t sq_idx, bool qjl_positive) {
+    sq_packed_[i] = static_cast<uint8_t>((sq_idx << 1) | (qjl_positive ? 1u : 0u));
+  }
+
+  /// Layout-aware unit accessor. Returns the 4- or 8-bit packed unit for
+  /// coordinate i: (sq_idx << 1) | qjl_bit.
+  inline uint8_t unit(size_t i, int bits_per_coord) const {
+    if (bits_per_coord <= 4) {
+      uint8_t byte = sq_packed_[i >> 1];
+      return (i & 1) ? (byte >> 4) : (byte & 0x0F);
+    }
+    return sq_packed_[i];
+  }
+  inline uint8_t sqIndex(size_t i, int bits_per_coord) const {
+    return unit(i, bits_per_coord) >> 1;
+  }
+  inline bool qjlSign(size_t i, int bits_per_coord) const {
+    return unit(i, bits_per_coord) & 1;
+  }
 
   // -- Meta accessors -------------------------------------------------------
 
@@ -152,9 +176,14 @@ public:
 
   // -- Size -----------------------------------------------------------------
 
-  /// HNSW buffer size in bytes for a given dimension.
-  static size_t codeSizeBytes(size_t dim) {
-    return dim + sizeof(float) * 3;
+  /// Bytes used by the packed region for given dim/bits.
+  static size_t packedBytes(size_t dim, int bits_per_coord) {
+    return (bits_per_coord <= 4) ? (dim + 1) / 2 : dim;
+  }
+
+  /// HNSW buffer size in bytes for a given dimension and bit budget.
+  static size_t codeSizeBytes(size_t dim, int bits_per_coord = 8) {
+    return packedBytes(dim, bits_per_coord) + sizeof(float) * 3;
   }
 };
 

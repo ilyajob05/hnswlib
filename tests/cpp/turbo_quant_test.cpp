@@ -140,12 +140,12 @@ bool test_sq_distortion(int bits_per_coord = 4) {
   auto rot_signs = generateSigns(D, rot_seed);
   TurboQuantSpace space(D, bits_per_coord, rot_seed, qjl_seed);
 
-  std::vector<char> buf(TurboQuantCode::codeSizeBytes(D));
+  std::vector<char> buf(space.codeSizeBytes());
 
   double total_mse = 0.0;
   for (size_t i = 0; i < N; ++i) {
     space.encodeVector(embeddings[i].data(), buf.data());
-    TurboQuantCode code(buf.data(), D);
+    TurboQuantCode code(buf.data(), D, bits_per_coord);
 
     // Reconstruct MSE part in rotated space
     std::vector<float> rotated(embeddings[i]);
@@ -159,7 +159,7 @@ bool test_sq_distortion(int bits_per_coord = 4) {
     float sigma = code.sigma();
     float mse = 0.0f;
     for (size_t j = 0; j < D; ++j) {
-      float recon_j = centroids[code.sqIndex(j)] * sigma;
+      float recon_j = centroids[code.sqIndex(j, bits_per_coord)] * sigma;
       float diff = rotated[j] - recon_j;
       mse += diff * diff;
     }
@@ -215,7 +215,7 @@ bool test_unbiasedness(int bits_per_coord = 4) {
     for (size_t s = 0; s < NUM_SEEDS; ++s) {
       TurboQuantSpace space(D, bits_per_coord, /*rot_seed=*/42,
                             /*qjl_seed=*/1000 + s);
-      std::vector<char> buf(TurboQuantCode::codeSizeBytes(D));
+      std::vector<char> buf(space.codeSizeBytes());
       space.encodeVector(x, buf.data());
       auto pq = space.prepareQuery(y);
       auto dist_func = space.get_search_dist_func();
@@ -266,7 +266,7 @@ bool test_lossless_identity(int bits_per_coord = 4) {
   TurboQuantSpace space(D, bits_per_coord, rot_seed, qjl_seed);
   const float *centroids = space.centroids();
 
-  std::vector<char> buf(TurboQuantCode::codeSizeBytes(D));
+  std::vector<char> buf(space.codeSizeBytes());
   double max_err = 0.0;
 
   for (size_t i = 0; i < N; ++i) {
@@ -276,7 +276,7 @@ bool test_lossless_identity(int bits_per_coord = 4) {
       float exact_ip = dot(x, y, D);
 
       space.encodeVector(x, buf.data());
-      TurboQuantCode code(buf.data(), D);
+      TurboQuantCode code(buf.data(), D, bits_per_coord);
 
       // Compute MSE IP in rotated space
       float x_norm = code.norm();
@@ -302,7 +302,7 @@ bool test_lossless_identity(int bits_per_coord = 4) {
       float ip_mse = 0.0f;
       float ip_res = 0.0f;
       for (size_t k = 0; k < D; ++k) {
-        float cv_k = centroids[code.sqIndex(k)] * sigma;
+        float cv_k = centroids[code.sqIndex(k, bits_per_coord)] * sigma;
         ip_mse += y_rot[k] * cv_k;
         ip_res += y_rot[k] * (x_rot[k] - cv_k);
       }
@@ -341,7 +341,7 @@ bool test_ip_correlation(int bits_per_coord = 4) {
   uint64_t qjl_seed = 137;
   TurboQuantSpace space(D, bits_per_coord, rot_seed, qjl_seed);
 
-  size_t code_size = TurboQuantCode::codeSizeBytes(D);
+  size_t code_size = space.codeSizeBytes();
   std::vector<std::vector<char>> codes(N, std::vector<char>(code_size));
   for (size_t i = 0; i < N; ++i) {
     space.encodeVector(embeddings[i].data(), codes[i].data());
@@ -420,7 +420,7 @@ bool test_recall_at_k(int bits_per_coord = 4) {
   uint64_t qjl_seed = 137;
   TurboQuantSpace space(D, bits_per_coord, rot_seed, qjl_seed);
 
-  size_t code_size = TurboQuantCode::codeSizeBytes(D);
+  size_t code_size = space.codeSizeBytes();
   std::vector<std::vector<char>> codes(N, std::vector<char>(code_size));
   for (size_t i = 0; i < N; ++i) {
     space.encodeVector(embeddings[i].data(), codes[i].data());
@@ -491,7 +491,7 @@ void test_memory_footprint() {
   constexpr int BITS = 8;
 
   size_t raw_bytes = D * sizeof(float);
-  size_t tq_bytes = TurboQuantCode::codeSizeBytes(D);
+  size_t tq_bytes = TurboQuantCode::codeSizeBytes(D, BITS);
   int mse_bits = BITS - 1;
 
   std::cout << "  Dimension:       " << D << std::endl;
@@ -533,7 +533,7 @@ bool test_encode_determinism(int bits_per_coord = 4) {
   uint64_t qjl_seed = 137;
   TurboQuantSpace space(D, bits_per_coord, rot_seed, qjl_seed);
 
-  size_t code_size = TurboQuantCode::codeSizeBytes(D);
+  size_t code_size = space.codeSizeBytes();
   bool all_match = true;
 
   for (size_t i = 0; i < N; ++i) {
@@ -1022,7 +1022,7 @@ void test_benchmark() {
   uint64_t qjl_seed = 137;
   TurboQuantSpace space(D, 8, rot_seed, qjl_seed);
 
-  size_t code_size = TurboQuantCode::codeSizeBytes(D);
+  size_t code_size = space.codeSizeBytes();
   std::vector<std::vector<char>> codes(N, std::vector<char>(code_size));
 
   // 1. Encode throughput
@@ -1097,11 +1097,21 @@ bool test_lut_correctness(int bits_per_coord = 4) {
     const float *query = embeddings[N + q].data();
     auto pq = tq_space.prepareQuery(query);
 
+    // Helper: extract unit = (sq_idx << 1) | qjl_bit for coord d, honoring
+    // the packed-nibble layout when b<=4.
+    auto extractUnit = [&](const uint8_t *packed, size_t d) -> uint8_t {
+      if (tq_space.packedNibbles()) {
+        uint8_t byte = packed[d >> 1];
+        return (d & 1) ? (byte >> 4) : (byte & 0x0F);
+      }
+      return packed[d];
+    };
+
     for (size_t i = 0; i < N; ++i) {
       const char *buf = codes[i].data();
-      // Interleaved layout: byte[i] = (sq_idx << 1) | qjl_bit, meta at buf + D
       const uint8_t *packed = reinterpret_cast<const uint8_t *>(buf);
-      const float *meta = reinterpret_cast<const float *>(buf + D);
+      const float *meta = reinterpret_cast<const float *>(
+          buf + tq_space.packedBytes());
       const float x_norm = meta[0];
       const float gamma = meta[1];
       const float sigma = meta[2];
@@ -1109,7 +1119,7 @@ bool test_lut_correctness(int bits_per_coord = 4) {
       // Reference MSE term (direct compute)
       float ip_mse_ref = 0.0f;
       for (size_t d = 0; d < D; ++d)
-        ip_mse_ref += pq.q_rot[d] * centroids[packed[d] >> 1] * sigma;
+        ip_mse_ref += pq.q_rot[d] * centroids[extractUnit(packed, d) >> 1] * sigma;
 
       // Verify full distance via TurboQuantSpace search dispatch
       float dist_dispatch = tq_space.get_search_dist_func()(&pq, buf,
@@ -1118,7 +1128,7 @@ bool test_lut_correctness(int bits_per_coord = 4) {
       // Reference full distance
       float dot_qjl = 0.0f;
       for (size_t d = 0; d < D; ++d) {
-        float sign = (packed[d] & 1) ? 1.0f : -1.0f;
+        float sign = (extractUnit(packed, d) & 1) ? 1.0f : -1.0f;
         dot_qjl += pq.s_q[d] * sign;
       }
       float scale = std::sqrt(static_cast<float>(M_PI) / 2.0f) /
@@ -1255,6 +1265,128 @@ bool test_turbo_quant_index() {
     std::cout << "  PASS";
   }
   std::cout << std::endl;
+  return pass;
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: TurboQuantIndex::buildFromL2 — L2 graph + TQ search + L2 rerank
+// Verifies that:
+//   - initL2Build / addL2Point / finalizeFromL2 compile and run end-to-end
+//   - buildFromL2() one-shot helper works
+//   - searchRerank() reads from the in-memory raw data stashed by finalize
+//   - recall from this path is at least as good as tq-graph rerank
+// ---------------------------------------------------------------------------
+bool test_turbo_quant_index_l2graph() {
+  std::cout << "=== Test 10: TurboQuantIndex::buildFromL2 ===" << std::endl;
+
+  constexpr size_t D = 128;
+  constexpr size_t N = 2000;
+  constexpr size_t NUM_QUERIES = 50;
+  constexpr size_t K = 10;
+  constexpr size_t M = 16;
+  constexpr size_t EF_CONSTRUCTION = 200;
+
+  auto embeddings = generateFaceEmbeddings(N, D, 100);
+
+  // Flat contiguous buffer
+  std::vector<float> flat(N * D);
+  for (size_t i = 0; i < N; ++i)
+    std::memcpy(flat.data() + i * D, embeddings[i].data(), D * sizeof(float));
+
+  // ---- Path A: low-level API (initL2Build + addL2Point + finalizeFromL2) --
+  TurboQuantIndex idx_lowlevel(D, 8);
+  idx_lowlevel.initL2Build(N, M, EF_CONSTRUCTION);
+  for (size_t i = 0; i < N; ++i)
+    idx_lowlevel.addL2Point(flat.data() + i * D, i);
+  auto st = idx_lowlevel.finalizeFromL2(flat.data(), N, /*keep_raw=*/true);
+  if (!st.ok()) {
+    std::cout << "  finalizeFromL2 failed: " << st.message() << "  FAIL"
+              << std::endl;
+    return false;
+  }
+  if (!idx_lowlevel.hasRawVectors()) {
+    std::cout << "  hasRawVectors() returned false after keep_raw=true  FAIL"
+              << std::endl;
+    return false;
+  }
+
+  // ---- Path B: high-level one-shot helper --------------------------------
+  TurboQuantIndex idx_oneshot(D, 8);
+  st = idx_oneshot.buildFromL2(flat.data(), N, M, EF_CONSTRUCTION,
+                               /*keep_raw=*/true);
+  if (!st.ok()) {
+    std::cout << "  buildFromL2 failed: " << st.message() << "  FAIL"
+              << std::endl;
+    return false;
+  }
+
+  // ---- Measure recall on both -------------------------------------------
+  std::mt19937_64 rng(999);
+  std::uniform_int_distribution<size_t> query_dist(0, N - 1);
+
+  idx_lowlevel.setEf(64);
+  idx_oneshot.setEf(64);
+
+  size_t rerank_hits_lowlevel = 0;
+  size_t rerank_hits_oneshot = 0;
+  size_t search_hits_lowlevel = 0;
+
+  for (size_t q = 0; q < NUM_QUERIES; ++q) {
+    size_t qi = query_dist(rng);
+    const float *query = embeddings[qi].data();
+
+    // Exact top-K
+    std::vector<std::pair<float, size_t>> exact_dists(N);
+    for (size_t i = 0; i < N; ++i)
+      exact_dists[i] = {l2_dist(query, embeddings[i].data(), D), i};
+    std::partial_sort(exact_dists.begin(), exact_dists.begin() + K,
+                      exact_dists.end());
+
+    // Pure TQ search (no rerank) on the low-level index
+    auto search_result = idx_lowlevel.search(query, K);
+    while (!search_result.empty()) {
+      size_t id = search_result.top().second;
+      for (size_t i = 0; i < K; ++i) {
+        if (exact_dists[i].second == id) { ++search_hits_lowlevel; break; }
+      }
+      search_result.pop();
+    }
+
+    // Rerank path — low-level index
+    auto rerank_ll = idx_lowlevel.searchRerank(query, K, 100);
+    for (const auto &p : rerank_ll)
+      for (size_t i = 0; i < K; ++i)
+        if (exact_dists[i].second == p.second) { ++rerank_hits_lowlevel; break; }
+
+    // Rerank path — one-shot index
+    auto rerank_os = idx_oneshot.searchRerank(query, K, 100);
+    for (const auto &p : rerank_os)
+      for (size_t i = 0; i < K; ++i)
+        if (exact_dists[i].second == p.second) { ++rerank_hits_oneshot; break; }
+  }
+
+  float search_recall =
+      static_cast<float>(search_hits_lowlevel) / (NUM_QUERIES * K);
+  float rerank_recall_ll =
+      static_cast<float>(rerank_hits_lowlevel) / (NUM_QUERIES * K);
+  float rerank_recall_os =
+      static_cast<float>(rerank_hits_oneshot) / (NUM_QUERIES * K);
+
+  std::cout << "  Code size:             " << idx_lowlevel.codeSizeBytes()
+            << " B/vec" << std::endl;
+  std::cout << "  TQ-only search recall: " << std::fixed
+            << std::setprecision(2) << (search_recall * 100.0f) << "%"
+            << std::endl;
+  std::cout << "  Rerank recall (llapi): " << (rerank_recall_ll * 100.0f)
+            << "%" << std::endl;
+  std::cout << "  Rerank recall (1shot): " << (rerank_recall_os * 100.0f)
+            << "%" << std::endl;
+
+  // L2-graph rerank should dominate TQ-only search.
+  bool pass = rerank_recall_ll >= search_recall &&
+              rerank_recall_os >= search_recall &&
+              rerank_recall_ll > 0.90f && rerank_recall_os > 0.90f;
+  std::cout << "  " << (pass ? "PASS" : "FAIL") << std::endl;
   return pass;
 }
 
@@ -1507,6 +1639,7 @@ int main() {
   }
 
   run(test_turbo_quant_index());
+  run(test_turbo_quant_index_l2graph());
 
   test_memory_footprint();
   std::cout << std::endl;

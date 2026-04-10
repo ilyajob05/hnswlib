@@ -982,6 +982,41 @@ class TQIndex {
         }
     }
 
+    void build_from_l2(py::object input, size_t M = 16, size_t ef_construction = 200,
+                       bool keep_raw = true, int num_threads = -1) {
+        py::array_t<float, py::array::c_style | py::array::forcecast> items(input);
+        auto buffer = items.request();
+        size_t rows, features;
+        get_input_array_shapes(buffer, &rows, &features);
+
+        if (features != dim)
+            HNSWLIB_THROW_RUNTIME_ERROR("Wrong dimensionality of the vectors");
+
+        if (num_threads <= 0)
+            num_threads = num_threads_default;
+
+        {
+            py::gil_scoped_release l;
+
+            tq_index.initL2Build(rows, M, ef_construction);
+
+            // First element single-threaded (entry point)
+            if (rows > 0)
+                tq_index.addL2Point(items.data(0), 0);
+
+            // Remaining elements in parallel
+            if (rows > 1) {
+                ParallelFor(1, rows, num_threads, [&](size_t row, size_t threadId) {
+                    tq_index.addL2Point(items.data(row), row);
+                });
+            }
+
+            auto status = tq_index.finalizeFromL2(items.data(0), rows, keep_raw);
+            if (!status.ok())
+                HNSWLIB_THROW_RUNTIME_ERROR(status.message());
+        }
+    }
+
     void save(const std::string &index_path, const std::string &raw_path = "",
               py::object raw_data_obj = py::none()) {
         const float *raw_data = nullptr;
@@ -1223,6 +1258,13 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("data"),
             py::arg("M") = 16,
             py::arg("ef_construction") = 200,
+            py::arg("num_threads") = -1)
+        .def("build_from_l2",
+            &TQIndex::build_from_l2,
+            py::arg("data"),
+            py::arg("M") = 16,
+            py::arg("ef_construction") = 200,
+            py::arg("keep_raw") = true,
             py::arg("num_threads") = -1)
         .def("save",
             &TQIndex::save,
