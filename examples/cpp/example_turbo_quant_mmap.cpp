@@ -43,7 +43,7 @@
 ///   (c) TQ search + mmap-based L2 re-ranking
 ///   (d) Comparison: no rerank vs mmap rerank vs L2 baseline
 
-#include "../../hnswlib/turbo_quant_space.h"
+#include "../../hnswlib/space_turbo_quant.h"
 
 #include <algorithm>
 #include <iomanip>

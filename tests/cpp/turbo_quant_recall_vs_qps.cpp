@@ -6,7 +6,7 @@
 /// Usage: turbo_quant_recall_vs_qps [base_dir]
 ///   base_dir defaults to "." and should contain bigann/ and glove/ subdirs.
 
-#include "hnswlib/turbo_quant_space.h"
+#include "hnswlib/space_turbo_quant.h"
 
 #include <algorithm>
 #include <chrono>
@@ -18,13 +18,59 @@
 #include <iostream>
 #include <numeric>
 #include <queue>
+#include <atomic>
+#include <exception>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
 #ifdef __APPLE__
 #include <mach/mach.h>
 #endif
+
+// Multithreaded executor (copied from examples/cpp/example_mt_search.cpp).
+template <class Function>
+inline void ParallelFor(size_t start, size_t end, size_t numThreads,
+                        Function fn) {
+  if (numThreads <= 0)
+    numThreads = std::thread::hardware_concurrency();
+  if (numThreads == 1) {
+    for (size_t id = start; id < end; id++)
+      fn(id, 0);
+    return;
+  }
+  std::vector<std::thread> threads;
+  std::atomic<size_t> current(start);
+  std::exception_ptr lastException = nullptr;
+  std::mutex lastExceptMutex;
+  for (size_t threadId = 0; threadId < numThreads; ++threadId) {
+    threads.push_back(std::thread([&, threadId] {
+      while (true) {
+        size_t id = current.fetch_add(1);
+        if (id >= end)
+          break;
+        try {
+          fn(id, threadId);
+        } catch (...) {
+          std::unique_lock<std::mutex> lk(lastExceptMutex);
+          lastException = std::current_exception();
+          current = end;
+          break;
+        }
+      }
+    }));
+  }
+  for (auto &t : threads)
+    t.join();
+  if (lastException)
+    std::rethrow_exception(lastException);
+}
+
+// Global thread counts (set from CLI in main).
+static size_t g_build_threads = 0; // 0 => hardware_concurrency
+static size_t g_search_threads = 1;
 
 using namespace hnswlib::turboquant;
 
@@ -185,21 +231,23 @@ computeBruteForceGT(const std::string &tag,
 static float measureRecall(hnswlib::HierarchicalNSW<float> &hnsw,
                            const std::vector<std::vector<float>> &queries,
                            const std::vector<std::vector<int>> &gt, size_t k) {
-  size_t correct = 0;
-  size_t total = 0;
-  for (size_t q = 0; q < queries.size(); ++q) {
+  std::atomic<size_t> correct(0);
+  std::atomic<size_t> total(0);
+  ParallelFor(0, queries.size(), g_search_threads, [&](size_t q, size_t) {
     auto result = hnsw.searchKnn(queries[q].data(), k);
     std::unordered_set<hnswlib::labeltype> gt_set;
     for (size_t j = 0; j < k && j < gt[q].size(); ++j)
       gt_set.insert(static_cast<hnswlib::labeltype>(gt[q][j]));
-    total += gt_set.size();
+    total.fetch_add(gt_set.size(), std::memory_order_relaxed);
+    size_t local_correct = 0;
     while (!result.empty()) {
       if (gt_set.count(result.top().second))
-        ++correct;
+        ++local_correct;
       result.pop();
     }
-  }
-  return static_cast<float>(correct) / static_cast<float>(total);
+    correct.fetch_add(local_correct, std::memory_order_relaxed);
+  });
+  return static_cast<float>(correct.load()) / static_cast<float>(total.load());
 }
 
 static float measureRecallTQ(hnswlib::HierarchicalNSW<float> &hnsw,
@@ -207,22 +255,24 @@ static float measureRecallTQ(hnswlib::HierarchicalNSW<float> &hnsw,
                              const std::vector<std::vector<float>> &queries,
                              const std::vector<std::vector<int>> &gt,
                              size_t k) {
-  size_t correct = 0;
-  size_t total = 0;
-  for (size_t q = 0; q < queries.size(); ++q) {
+  std::atomic<size_t> correct(0);
+  std::atomic<size_t> total(0);
+  ParallelFor(0, queries.size(), g_search_threads, [&](size_t q, size_t) {
     auto pq = space.prepareQuery(queries[q].data());
     auto result = hnsw.searchKnn(&pq, k);
     std::unordered_set<hnswlib::labeltype> gt_set;
     for (size_t j = 0; j < k && j < gt[q].size(); ++j)
       gt_set.insert(static_cast<hnswlib::labeltype>(gt[q][j]));
-    total += gt_set.size();
+    total.fetch_add(gt_set.size(), std::memory_order_relaxed);
+    size_t local_correct = 0;
     while (!result.empty()) {
       if (gt_set.count(result.top().second))
-        ++correct;
+        ++local_correct;
       result.pop();
     }
-  }
-  return static_cast<float>(correct) / static_cast<float>(total);
+    correct.fetch_add(local_correct, std::memory_order_relaxed);
+  });
+  return static_cast<float>(correct.load()) / static_cast<float>(total.load());
 }
 
 // ---------------------------------------------------------------------------
@@ -242,7 +292,7 @@ static void emitCSV(const std::string &dataset, const std::string &method,
   } else {
     std::cout << ",,";
   }
-  std::cout << "\n";
+  std::cout << "," << g_search_threads << "," << g_build_threads << "\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -266,9 +316,9 @@ static void benchmarkL2(const std::string &tag,
 
   hnswlib::HierarchicalNSW<float> hnsw(&l2space, N, M, ef_construction);
   hnsw.addPoint(base_data[0].data(), 0);
-#pragma omp parallel for schedule(static, 16)
-  for (int i = 1; i < static_cast<int>(N); ++i)
-    hnsw.addPoint(base_data[i].data(), static_cast<size_t>(i));
+  ParallelFor(1, N, g_build_threads, [&](size_t i, size_t) {
+    hnsw.addPoint(base_data[i].data(), i);
+  });
 
   double build_time = sw.elapsedSeconds();
   size_t rss_after = getCurrentRSS();
@@ -321,9 +371,9 @@ static void benchmarkTQ(const std::string &tag,
 
   // Parallel encode (encodeVector is stateless)
   std::vector<std::vector<char>> codes(N, std::vector<char>(code_size));
-#pragma omp parallel for schedule(static, 16)
-  for (int i = 0; i < static_cast<int>(N); ++i)
+  ParallelFor(0, N, g_build_threads, [&](size_t i, size_t) {
     tqspace.encodeVector(base_data[i].data(), codes[i].data());
+  });
 
   double encode_time = sw.elapsedSeconds();
   std::cerr << "[" << tag << "] " << method << " encode: " << std::fixed
@@ -338,9 +388,9 @@ static void benchmarkTQ(const std::string &tag,
 
   hnswlib::HierarchicalNSW<float> hnsw(&tqspace, N, M, ef_construction);
   hnsw.addPoint(codes[0].data(), 0);
-#pragma omp parallel for schedule(static, 16)
-  for (int i = 1; i < static_cast<int>(N); ++i)
-    hnsw.addPoint(codes[i].data(), static_cast<size_t>(i));
+  ParallelFor(1, N, g_build_threads, [&](size_t i, size_t) {
+    hnsw.addPoint(codes[i].data(), i);
+  });
 
   double insert_time = sw.elapsedSeconds();
   double build_time = encode_time + insert_time;
@@ -351,6 +401,9 @@ static void benchmarkTQ(const std::string &tag,
   std::cerr << "[" << tag << "] " << method << " insert: " << std::fixed
             << std::setprecision(2) << insert_time
             << " s (total build: " << build_time << " s)" << std::endl;
+
+  // Switch distance function from symmetric (build) to asymmetric (search).
+  tqspace.setSearchMode(hnsw);
 
   // Warmup
   hnsw.setEf(10);
@@ -407,9 +460,9 @@ static void benchmarkL2GraphTQ(const std::string &tag,
 
   hnswlib::HierarchicalNSW<float> hnsw(&l2space, N, M, ef_construction);
   hnsw.addPoint(base_data[0].data(), 0);
-#pragma omp parallel for schedule(static, 16)
-  for (int i = 1; i < static_cast<int>(N); ++i)
-    hnsw.addPoint(base_data[i].data(), static_cast<size_t>(i));
+  ParallelFor(1, N, g_build_threads, [&](size_t i, size_t) {
+    hnsw.addPoint(base_data[i].data(), i);
+  });
 
   double l2_build_time = sw.elapsedSeconds();
   std::cerr << "[" << tag << "] " << method << ": L2 build: " << std::fixed
@@ -433,9 +486,8 @@ static void benchmarkL2GraphTQ(const std::string &tag,
             << ": encode+replace: " << std::fixed << std::setprecision(2)
             << encode_time << " s (total: " << build_time << " s)" << std::endl;
 
-  // Swap distance function to TQ
-  hnsw.fstdistfunc_ = tqspace.get_dist_func();
-  hnsw.dist_func_param_ = tqspace.get_dist_func_param();
+  // Swap distance function to TQ asymmetric search (PreparedQuery × code).
+  tqspace.setSearchMode(hnsw);
 
   size_t rss_after = getCurrentRSS();
   size_t mem_per_vec =
@@ -484,9 +536,9 @@ static void benchmarkTQRerank(const std::string &tag,
 
   // Parallel encode
   std::vector<std::vector<char>> codes(N, std::vector<char>(code_size));
-#pragma omp parallel for schedule(static, 16)
-  for (int i = 0; i < static_cast<int>(N); ++i)
+  ParallelFor(0, N, g_build_threads, [&](size_t i, size_t) {
     tqspace.encodeVector(base_data[i].data(), codes[i].data());
+  });
 
   double encode_time = sw.elapsedSeconds();
 
@@ -498,9 +550,9 @@ static void benchmarkTQRerank(const std::string &tag,
 
   hnswlib::HierarchicalNSW<float> hnsw(&tqspace, N, M, ef_construction);
   hnsw.addPoint(codes[0].data(), 0);
-#pragma omp parallel for schedule(static, 16)
-  for (int i = 1; i < static_cast<int>(N); ++i)
-    hnsw.addPoint(codes[i].data(), static_cast<size_t>(i));
+  ParallelFor(1, N, g_build_threads, [&](size_t i, size_t) {
+    hnsw.addPoint(codes[i].data(), i);
+  });
 
   double insert_time = sw.elapsedSeconds();
   double build_time = encode_time + insert_time;
@@ -532,11 +584,11 @@ static void benchmarkTQRerank(const std::string &tag,
   bool first = true;
   for (size_t ef : ef_values) {
     hnsw.setEf(ef);
-    size_t correct = 0;
-    size_t total = 0;
+    std::atomic<size_t> correct(0);
+    std::atomic<size_t> total(0);
 
     sw.reset();
-    for (size_t q = 0; q < queries.size(); ++q) {
+    ParallelFor(0, queries.size(), g_search_threads, [&](size_t q, size_t) {
       const float *query = queries[q].data();
 
       // TQ search: retrieve ef candidates
@@ -565,15 +617,18 @@ static void benchmarkTQRerank(const std::string &tag,
       std::unordered_set<hnswlib::labeltype> gt_set;
       for (size_t j = 0; j < K && j < gt[q].size(); ++j)
         gt_set.insert(static_cast<hnswlib::labeltype>(gt[q][j]));
-      total += gt_set.size();
+      total.fetch_add(gt_set.size(), std::memory_order_relaxed);
+      size_t local_correct = 0;
       for (size_t i = 0; i < K && i < shortlist.size(); ++i) {
         if (gt_set.count(shortlist[i].second))
-          ++correct;
+          ++local_correct;
       }
-    }
+      correct.fetch_add(local_correct, std::memory_order_relaxed);
+    });
 
     double us_per_q = sw.elapsedSeconds() / queries.size() * 1e6;
-    float recall = static_cast<float>(correct) / static_cast<float>(total);
+    float recall =
+        static_cast<float>(correct.load()) / static_cast<float>(total.load());
     emitCSV(tag, method, ef, recall, us_per_q, build_time, mem_per_vec, first);
     first = false;
     std::cerr << "[" << tag << "]   ef=" << ef << ": recall=" << std::fixed
@@ -600,13 +655,31 @@ struct DatasetDesc {
 // ---------------------------------------------------------------------------
 
 int main(int argc, char **argv) {
+  // Usage: turbo_quant_recall_vs_qps [base_dir] [search_threads] [build_threads]
+  //   search_threads: 0 => hardware_concurrency (default: 1)
+  //   build_threads:  0 => hardware_concurrency (default: 0)
   std::string base_dir = ".";
   if (argc > 1)
     base_dir = argv[1];
+  if (argc > 2)
+    g_search_threads = static_cast<size_t>(std::atoi(argv[2]));
+  if (argc > 3)
+    g_build_threads = static_cast<size_t>(std::atoi(argv[3]));
 
   // Strip trailing slash
   while (base_dir.size() > 1 && base_dir.back() == '/')
     base_dir.pop_back();
+
+  size_t effective_search =
+      g_search_threads == 0 ? std::thread::hardware_concurrency()
+                            : g_search_threads;
+  size_t effective_build =
+      g_build_threads == 0 ? std::thread::hardware_concurrency()
+                           : g_build_threads;
+  std::cerr << "[config] search_threads=" << g_search_threads << " ("
+            << effective_search << " effective), build_threads="
+            << g_build_threads << " (" << effective_build << " effective)"
+            << std::endl;
 
   const size_t M = 16;
   const size_t EF_CONSTRUCTION = 200;
@@ -633,7 +706,8 @@ int main(int argc, char **argv) {
 
   // CSV header
   std::cout << "dataset,method,ef,recall,us_per_query,build_time_s,"
-            << "memory_bytes_per_vec" << std::endl;
+            << "memory_bytes_per_vec,search_threads,build_threads"
+            << std::endl;
 
   for (const auto &ds : datasets) {
     // Check if dataset exists

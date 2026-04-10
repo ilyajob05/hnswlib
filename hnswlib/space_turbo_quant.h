@@ -123,114 +123,43 @@ inline LloydMaxTable computeLloydMax(int bits, int maxIter = 1000,
     return table;
 }
 
-class RndGen64
-{
-    uint64_t state_;
+// ===========================================================================
+// TurboQuantPreparedQuery — pre-computed query state for search
+//
+// Created once per query via prepareQuery(), reused across all candidate
+// distance computations. Eliminates 2 RHT calls per distance evaluation.
+// Lives on the caller's stack — no shared mutable state, fully thread-safe.
+// ===========================================================================
 
-public:
-    explicit RndGen64(uint64_t const seed)
-        : state_(seed)
-    {}
-
-    uint64_t next()
-    {
-        uint64_t z = (state_ += 0x9e3779b97f4a7c15ULL);
-        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
-        z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-        return z ^ (z >> 31);
-    }
+struct TurboQuantPreparedQuery {
+  std::vector<float> q_rot; ///< normalized + RHT-rotated query (dim floats)
+  std::vector<float> s_q;   ///< RHT(q_rot, qjl_signs) for QJL correction
+  float q_norm_sq;           ///< ||query||^2
+  float q_norm;              ///< ||query||
+  const float *centroids;    ///< pointer to centroid table (not owned)
 };
 
-// Walsh-Hadamard Transform (WHT) — scalar fallback
-inline void whtInplaceScalar(float *data, size_t const d)
-{
-    for (size_t step = 1; step < d; step <<= 1) {
-        const size_t jump = step << 1;
-        for (size_t i = 0; i < d; i += jump) {
-            float *__restrict__ low = &data[i];
-            float *__restrict__ high = &data[i + step];
-            for (size_t j = 0; j < step; ++j) {
-                float a = low[j];
-                float b = high[j];
-                low[j] = a + b;
-                high[j] = a - b;
-            }
-        }
-    }
-}
-
-// Walsh-Hadamard Transform (WHT)
-inline void whtInplace(float *data, size_t const d)
-{
-    assert(d > 0 && (d & (d - 1)) == 0 && "whtInplace: d must be a positive power of 2");
-    whtInplaceScalar(data, d);
-
-    // Normalize
-    float norm = 1.0f / std::sqrt(static_cast<float>(d));
-    for (size_t i = 0; i < d; ++i)
-        data[i] *= norm;
-}
-
-inline std::vector<float> generateSigns(size_t const d, uint64_t const seed)
-{
-    std::vector<float> signs(d);
-    RndGen64 rng(seed);
-    for (size_t i = 0; i < d; ++i) {
-        uint64_t bits = rng.next();
-        if (bits & 1) {
-            signs[i] = 1.0f;
-        } else {
-            signs[i] = 0.0f;
-        }
-    }
-    return signs;
-}
-
-// Randomized Walsh-Hadamard Transform. Elementwise multiply + WHT.
-inline void randomizedHadamard(float *data, const float *const __restrict__ signs, size_t const d)
-{
-    assert(d > 0 && (d & (d - 1)) == 0 && "randomizedHadamard: d must be a positive power of 2");
-
-    for (size_t i = 0; i < d; ++i) {
-        data[i] *= signs[i];
-    }
-    whtInplace(data, d);
-}
-
-// Forward declaration
+// Forward declarations
 class TurboQuantSpace;
 
-// template<typename MTYPE>
-// using DIST_TQ_FUNC = MTYPE (*)(const float q, const char *code_buf, const TurboQuantCode *code);
-
+// Distance function forward declarations (defined after TurboQuantSpace)
 static float distSearchScalar(const void *q, const void *code_buf, const void *qty_ptr);
-// static float distSearchScalarTQ(const float q, const char *code_buf, const TurboQuantCode *code);
+static float distBuildScalar(const void *pVect1, const void *pVect2, const void *param_ptr);
 
 #if defined(USE_NEON)
-static float distSearchNEON(const float q, const char *code_buf, const TurboQuantCode *code);
-
-static float distBuildNEON(const void *pVect1, const void *pVect2,
-                           const void *param_ptr);
-#endif // USE_NEON
+static float distSearchNEON(const void *q, const void *code_buf, const void *qty_ptr);
+static float distBuildNEON(const void *pVect1, const void *pVect2, const void *param_ptr);
+#endif
 
 #if defined(USE_SSE)
-static float distSearchSSE(const TurboQuantPreparedQuery *pq,
-                           const char *code_buf,
-                           const TurboQuantCode *code);
-
-static float distBuildSSE(const void *pVect1, const void *pVect2,
-                          const void *param_ptr);
-
-#endif // USE_SSE
+static float distSearchSSE(const void *q, const void *code_buf, const void *qty_ptr);
+static float distBuildSSE(const void *pVect1, const void *pVect2, const void *param_ptr);
+#endif
 
 #if defined(USE_AVX)
-static float distSearchAVX(const TurboQuantPreparedQuery *pq,
-                           const char *code_buf,
-                           const TurboQuantCode *code);
-
-static float distBuildAVX(const void *pVect1, const void *pVect2,
-                          const void *param_ptr);
-#endif // USE_AVX
+static float distSearchAVX(const void *q, const void *code_buf, const void *qty_ptr);
+static float distBuildAVX(const void *pVect1, const void *pVect2, const void *param_ptr);
+#endif
 
 class TurboQuantSpace : public SpaceInterface<float> {
     LloydMaxTable lm_table_;
@@ -238,54 +167,62 @@ class TurboQuantSpace : public SpaceInterface<float> {
     uint16_t num_boundaries_;
     float *centroids_;
 
-    TurboQuantCode tq_code_;
     std::vector<float> rotation_signs_;
     std::vector<float> qjl_signs_precomp_;
 
     const uint64_t rot_seed_;
     const uint64_t qjl_seed_;
     const size_t dim_;
-    const size_t q_dim_;
     const size_t data_size_;
     const int num_levels_;
     const float scale_;
-    // DISTFUNC<float> fstdistfunc_;
     DISTFUNC<float> fstdistfunc_;
+    DISTFUNC<float> fstdistfunc_build_;
+    DISTFUNC<float> fstdistfunc_search_;
 
 public:
     TurboQuantSpace(size_t dim,
-                    int bits_per_coord = 8,
+                    int bits_per_coord = 4,
                     uint64_t rot_seed = 42,
                     uint64_t qjl_seed = 271)
-        : tq_code_(dim)
-        , rot_seed_(rot_seed)
+        : rot_seed_(rot_seed)
         , qjl_seed_(qjl_seed)
         , dim_(dim)
-        , q_dim_(bits_per_coord)
-        , data_size_(dim + 12)
+        , data_size_(TurboQuantCode::codeSizeBytes(dim))
         , num_levels_(1 << (bits_per_coord - 1))
-        , scale_(std::sqrtf(static_cast<float>(M_PI) / 2.0f) / std::sqrtf(static_cast<float>(dim)))
+        , scale_(std::sqrt(static_cast<float>(M_PI) / 2.0f) / std::sqrt(static_cast<float>(dim)))
     {
-        assert(q_dim_ >= 4 && "TurboQuantSpace: bits_per_coord must be at least 4");
-        assert(
-            (q_dim_ & (q_dim_ - 1)) == 0 && "TurboQuantSpace: bits_per_coord must be a power of 2");
-        assert((dim_ & (dim_ - 1)) == 0 && "TurboQuantSpace: dim_ must be a power of 2");
+        assert(dim >= 4 && "TurboQuantSpace: dim must be at least 4");
+        assert((dim & (dim - 1)) == 0 && "TurboQuantSpace: dim must be a power of 2");
+        assert(bits_per_coord >= 2 &&
+               "TurboQuantSpace: need at least 2 bits (1 MSE + 1 QJL)");
+        assert(bits_per_coord <= 9 &&
+               "TurboQuantSpace: max 9 bits (8-bit MSE + 1 QJL, uint8_t limit)");
 
         // Runtime SIMD dispatch
+        // Default to build (symmetric code×code) distance.
+        // Call setSearchMode(hnsw) after build to switch to asymmetric search.
 #if defined(USE_AVX)
-        fstdistfunc_ = distSearchAVX;
-#elif defined(USE_NEON)
-        // fstdistfunc_ = distSearchNEON;
-        fstdistfunc_ = distSearchScalar;
+        fstdistfunc_ = distBuildAVX;
+        fstdistfunc_build_ = distBuildAVX;
+        fstdistfunc_search_ = distSearchAVX;
 #elif defined(USE_SSE)
-        fstdistfunc_ = distSearchSSE;
+        fstdistfunc_ = distBuildSSE;
+        fstdistfunc_build_ = distBuildSSE;
+        fstdistfunc_search_ = distSearchSSE;
+#elif defined(USE_NEON)
+        fstdistfunc_ = distBuildNEON;
+        fstdistfunc_build_ = distBuildNEON;
+        fstdistfunc_search_ = distSearchNEON;
 #else
-        fstdistfunc_ = distSearchScalar;
+        fstdistfunc_ = distBuildScalar;
+        fstdistfunc_build_ = distBuildScalar;
+        fstdistfunc_search_ = distSearchScalar;
 #endif
 
-        lm_table_ = computeLloydMax(q_dim_);
+        lm_table_ = computeLloydMax(bits_per_coord - 1);
         boundaries_ = lm_table_.boundaries.data();
-        num_boundaries_ = static_cast<int16_t>(lm_table_.boundaries.size());
+        num_boundaries_ = static_cast<uint16_t>(lm_table_.boundaries.size());
         centroids_ = lm_table_.centroids.data();
         rotation_signs_ = generateSigns(dim_, rot_seed_);
         qjl_signs_precomp_ = generateSigns(dim_, qjl_seed_);
@@ -294,39 +231,36 @@ public:
     // SpaceInterface
     size_t get_data_size() override { return data_size_; }
     DISTFUNC<float> get_dist_func() override { return fstdistfunc_; }
-    void *get_dist_func_param() override { return const_cast<size_t *>(&dim_); }
+    void *get_dist_func_param() override { return this; }
 
-    static float turboQuantL2Search(const void *p_vec1, const void *p_vec2, const void *param_ptr)
-    {
-        const auto *space = static_cast<const TurboQuantSpace *>(param_ptr);
-        const auto *pq = static_cast<const TurboQuantPreparedQuery *>(pVect1);
-        return space->dist_search_func_(pq, static_cast<const char *>(pVect2), space);
-    }
-
-    static float distSearchScalar(const void *q, const void *code_buf, const void *qty_ptr) { ; }
+    // Search distance function (asymmetric: PreparedQuery × code)
+    DISTFUNC<float> get_search_dist_func() const { return fstdistfunc_search_; }
 
     // Accessors
     size_t dim() const { return dim_; }
     size_t codeSizeBytes() const { return data_size_; }
     int numLevels() const { return num_levels_; }
     float scale() const { return scale_; }
+    const float *centroids() const { return centroids_; }
     uint64_t rotSeed() const { return rot_seed_; }
     uint64_t qjlSeed() const { return qjl_seed_; }
 
-    // Encoding
-    void encode_vector(const float *raw, uint8_t *out_q_buf)
-    {
-        float *meta = reinterpret_cast<float *>(out_q_buf + dim_);
+    // -- Encoding -------------------------------------------------------------
+
+    /// Encode a raw float vector directly into an HNSW buffer slot.
+    /// Layout: [packed: dim bytes] [meta: 12 bytes (norm, gamma, sigma)]
+    void encodeVector(const float *raw, void *out_buf) const {
+        TurboQuantCode code(out_buf, dim_);
 
         // Step 1: norm
         float norm_sq = 0.0f;
         for (size_t i = 0; i < dim_; ++i)
             norm_sq += raw[i] * raw[i];
-        tq_code_.norm_ = std::sqrt(norm_sq);
+        float norm = std::sqrt(norm_sq);
 
         // Step 2: normalize + RHT
         std::vector<float> rotated(dim_);
-        float inv_norm = (tq_code_.norm_ > 1e-10f) ? (1.0f / tq_code_.norm_) : 0.0f;
+        float inv_norm = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;
         for (size_t i = 0; i < dim_; ++i)
             rotated[i] = raw[i] * inv_norm;
         randomizedHadamard(rotated.data(), rotation_signs_.data(), dim_);
@@ -335,76 +269,50 @@ public:
         float var = 0.0f;
         for (size_t i = 0; i < dim_; ++i)
             var += rotated[i] * rotated[i];
-        tq_code_.sigma_ = std::sqrt(var / static_cast<float>(dim_));
-        if (tq_code_.sigma_ < 1e-10f)
-            tq_code_.sigma_ = 1e-10f;
-        float inv_sigma = 1.0f / tq_code_.sigma_;
+        float sigma = std::sqrt(var / static_cast<float>(dim_));
+        if (sigma < 1e-10f)
+            sigma = 1e-10f;
+        float inv_sigma = 1.0f / sigma;
 
         // Step 4: quantize + residual (single pass)
         std::vector<float> residual(dim_);
         for (size_t i = 0; i < dim_; ++i) {
             float normalized = rotated[i] * inv_sigma;
             uint8_t sq_idx = quantize(normalized);
-            residual[i] = rotated[i] - centroids_[sq_idx] * tq_code_.sigma_;
-            out_q_buf[i] = sq_idx << 1; // QJL bit added in step 6
+            residual[i] = rotated[i] - centroids_[sq_idx] * sigma;
+            code.sq_packed_[i] = sq_idx << 1; // QJL bit added in step 6
         }
 
         // Step 5: gamma
         float gamma_sq = 0.0f;
         for (size_t i = 0; i < dim_; ++i)
             gamma_sq += residual[i] * residual[i];
-        tq_code_.gamma_ = std::sqrt(gamma_sq);
+        float gamma = std::sqrt(gamma_sq);
 
         // Step 6: QJL projection + pack sign into bit 0
         randomizedHadamard(residual.data(), qjl_signs_precomp_.data(), dim_);
         for (size_t i = 0; i < dim_; ++i) {
-            out_q_buf[i] |= (residual[i] >= 0.0f) ? 1u : 0u;
+            code.sq_packed_[i] |= (residual[i] >= 0.0f) ? 1u : 0u;
         }
 
         // Meta
-        meta[0] = tq_code_.norm_;
-        meta[1] = tq_code_.gamma_;
-        meta[2] = tq_code_.sigma_;
+        code.setNorm(norm);
+        code.setGamma(gamma);
+        code.setSigma(sigma);
     }
 
-    void quantize_batch(const float *__restrict__ vals,
-                        uint8_t *__restrict__ q_buff,
-                        const size_t count)
-    {
-        assert(num_boundaries_ > 0 && "quantizeBatch: empty boundary table");
-        for (size_t i = 0; i < count; ++i) {
-            q_buff[i] = quantize(vals[i]);
-        }
-    }
-
-    inline uint8_t quantize(const float val) const
-    {
-        assert(num_levels_ > 0 && "quantize: empty boundary table");
+    inline uint8_t quantize(const float val) const {
         uint8_t idx = 0;
-        for (int i = 0; i < num_boundaries_; ++i) {
+        for (uint16_t i = 0; i < num_boundaries_; ++i) {
             idx += (val > boundaries_[i]); // branchless accumulation
         }
         return idx;
     }
 
-    inline float dequantize_centroids(const uint8_t idx) const { return centroids_[idx]; }
-
-    inline float dequantize(const size_t i, const uint8_t *q_buff) const
-    {
-        return dequantize_centroids(q_buff[i]);
-    }
-
-    void dequantize_batch(float *__restrict__ out, const uint8_t *q_buff, const size_t count) const
-    {
-        for (size_t i = 0; i < count; ++i) {
-            out[i] = dequantize(i, q_buff) * tq_code_.sigma_;
-        }
-    }
-
     // -- Mode switching -------------------------------------------------------
     //
     // Two-phase workflow:
-    //   1. Build: hnsw uses turboQuantL2Build (default from get_dist_func).
+    //   1. Build: use setBuildMode(hnsw) — symmetric distance (code × code).
     //   2. Search: call setSearchMode(hnsw) once after build completes.
     //      Then each thread does:
     //        auto pq = space.prepareQuery(raw_query);
@@ -412,25 +320,22 @@ public:
     //      No shared mutable state — fully thread-safe.
 
     /// Switch HNSW to search mode: asymmetric distance (PreparedQuery* × code).
-    void setSearchMode(HierarchicalNSW<float> &hnsw) const
-    {
-        hnsw.fstdistfunc_ = &turboQuantL2Search;
-        hnsw.dist_func_param_ = const_cast<TurboQuantSpace *>(this);
+    void setSearchMode(HierarchicalNSW<float> &hnsw) {
+        hnsw.fstdistfunc_ = fstdistfunc_search_;
+        hnsw.dist_func_param_ = this;
     }
 
-    /// Switch HNSW back to build mode: symmetric distance (code × code).
-    void setBuildMode(HierarchicalNSW<float> &hnsw) const
-    {
-        hnsw.fstdistfunc_ = &turboQuantL2Build;
-        hnsw.dist_func_param_ = const_cast<TurboQuantSpace *>(this);
+    /// Switch HNSW to build mode: symmetric distance (code × code).
+    void setBuildMode(HierarchicalNSW<float> &hnsw) {
+        hnsw.fstdistfunc_ = fstdistfunc_build_;
+        hnsw.dist_func_param_ = this;
     }
 
     // -- Query preparation ----------------------------------------------------
 
     /// Prepare query: amortizes 2 RHT calls across all distance computations.
     /// Result lives on the caller's stack — no shared state.
-    TurboQuantPreparedQuery prepareQuery(const float *raw_query) const
-    {
+    TurboQuantPreparedQuery prepareQuery(const float *raw_query) const {
         TurboQuantPreparedQuery pq;
         const size_t d = dim_;
 
@@ -445,14 +350,14 @@ public:
         pq.q_rot.resize(d);
         for (size_t i = 0; i < d; ++i)
             pq.q_rot[i] = raw_query[i] * q_inv;
-        randomizedHadamard(pq.q_rot.data(), encoder_.rotationSigns(), d);
+        randomizedHadamard(pq.q_rot.data(), rotation_signs_.data(), d);
 
         // Store centroids pointer for direct compute in distSearch
-        pq.centroids = encoder_.centroids();
+        pq.centroids = centroids_;
 
         // QJL projection of query for correction term
         pq.s_q = pq.q_rot;
-        randomizedHadamard(pq.s_q.data(), encoder_.qjlSigns(), d);
+        randomizedHadamard(pq.s_q.data(), qjl_signs_precomp_.data(), d);
 
         return pq;
     }
@@ -474,25 +379,18 @@ public:
 // Each variant has the same signature; the constructor selects one at runtime.
 // ===========================================================================
 
-// -- helpers for reading dim/scale from TurboQuantSpace ---------------------
-// (avoid friend declarations; these are trivially inlineable)
-
-// inline size_t tqsDim(const TurboQuantSpace *s) { return s->dim(); }
-// inline float tqsScale(const TurboQuantSpace *s) { return s->scale(); }
-// inline const float *tqsCentroids(const TurboQuantSpace *s) {
-// return s->encoder().centroids();
-// }
-
 // ---------------------------------------------------------------------------
 // Scalar fallback
 // ---------------------------------------------------------------------------
 
-static float distSearchScalar(const TurboQuantPreparedQuery *pq,
-                              const char *code_buf,
-                              const TurboQuantSpace *space) {
+static float distSearchScalar(const void *q, const void *code_buf,
+                              const void *qty_ptr) {
+  const auto *space = static_cast<const TurboQuantSpace *>(qty_ptr);
+  const auto *pq = static_cast<const TurboQuantPreparedQuery *>(q);
   const size_t dim = space->dim();
   const uint8_t *packed = reinterpret_cast<const uint8_t *>(code_buf);
-  const float *meta = reinterpret_cast<const float *>(code_buf + dim);
+  const float *meta = reinterpret_cast<const float *>(
+      static_cast<const char *>(code_buf) + dim);
   const float x_norm = meta[0];
   const float gamma = meta[1];
   const float sigma = meta[2];
@@ -522,7 +420,7 @@ static float distBuildScalar(const void *pVect1, const void *pVect2,
                              const void *param_ptr) {
   const auto *space = static_cast<const TurboQuantSpace *>(param_ptr);
   const size_t dim = space->dim();
-  const float16_t *centroids = space->encoder().centroids();
+  const float *centroids = space->centroids();
 
   const char *buf_a = static_cast<const char *>(pVect1);
   const char *buf_b = static_cast<const char *>(pVect2);
@@ -551,29 +449,31 @@ static float distBuildScalar(const void *pVect1, const void *pVect2,
 // ---------------------------------------------------------------------------
 #if defined(USE_NEON)
 
-static float distSearchNEON(const TurboQuantPreparedQuery *pq,
-                            const char *code_buf,
-                            const TurboQuantSpace *space) {
+static float distSearchNEON(const void *q, const void *code_buf,
+                            const void *qty_ptr) {
+  const auto *space = static_cast<const TurboQuantSpace *>(qty_ptr);
+  const auto *pq = static_cast<const TurboQuantPreparedQuery *>(q);
   const size_t dim = space->dim();
   const uint8_t *packed = reinterpret_cast<const uint8_t *>(code_buf);
-  const float *meta = reinterpret_cast<const float *>(code_buf + dim);
+  const float *meta = reinterpret_cast<const float *>(
+      static_cast<const char *>(code_buf) + dim);
   const float x_norm = meta[0];
   const float gamma = meta[1];
   const float sigma = meta[2];
 
   const float *centroids = pq->centroids;
-  const float16_t *q_rot = pq->q_rot.data();
-  const float16_t *s_q = pq->s_q.data();
+  const float *q_rot = pq->q_rot.data();
+  const float *s_q = pq->s_q.data();
 
   // Sign-flip mask: XOR with this flips the sign bit of a float
-  const uint16x8_t sign_bit = vdupq_n_u16(0x8000u);
+  const uint32x4_t sign_bit = vdupq_n_u32(0x80000000u);
   // Mask for extracting qjl_bit (bit 0)
   const uint8x8_t one_u8 = vdup_n_u8(1);
 
-  float16x8_t sum_ip0 = vdupq_n_f16(0.0f);
-  float16x8_t sum_ip1 = vdupq_n_f16(0.0f);
-  float16x8_t sum_qjl0 = vdupq_n_f16(0.0f);
-  float16x8_t sum_qjl1 = vdupq_n_f16(0.0f);
+  float32x4_t sum_ip0 = vdupq_n_f32(0.0f);
+  float32x4_t sum_ip1 = vdupq_n_f32(0.0f);
+  float32x4_t sum_qjl0 = vdupq_n_f32(0.0f);
+  float32x4_t sum_qjl1 = vdupq_n_f32(0.0f);
 
   size_t i = 0;
   for (; i + 8 <= dim; i += 8) {
@@ -629,7 +529,7 @@ static float distSearchNEON(const TurboQuantPreparedQuery *pq,
   float ip_mse = vaddvq_f32(vaddq_f32(sum_ip0, sum_ip1)) * sigma;
   float dot_qjl = vaddvq_f32(vaddq_f32(sum_qjl0, sum_qjl1));
 
-  const float correction = tqsScale(space) * gamma * dot_qjl;
+  const float correction = space->scale() * gamma * dot_qjl;
   const float ip = (ip_mse + correction) * x_norm * pq->q_norm;
   return std::max(0.0f, pq->q_norm_sq + x_norm * x_norm - 2.0f * ip);
 }
@@ -637,8 +537,8 @@ static float distSearchNEON(const TurboQuantPreparedQuery *pq,
 static float distBuildNEON(const void *pVect1, const void *pVect2,
                            const void *param_ptr) {
   const auto *space = static_cast<const TurboQuantSpace *>(param_ptr);
-  const size_t dim = tqsDim(space);
-  const float *centroids = tqsCentroids(space);
+  const size_t dim = space->dim();
+  const float *centroids = space->centroids();
 
   const char *buf_a = static_cast<const char *>(pVect1);
   const char *buf_b = static_cast<const char *>(pVect2);
@@ -691,11 +591,14 @@ static float distBuildNEON(const void *pVect1, const void *pVect2,
 // ---------------------------------------------------------------------------
 #if defined(USE_SSE)
 
-static float distSearchSSE(const TurboQuantPreparedQuery *pq,
-                           const char *code_buf, const TurboQuantSpace *space) {
-  const size_t dim = tqsDim(space);
+static float distSearchSSE(const void *q, const void *code_buf,
+                           const void *qty_ptr) {
+  const auto *space = static_cast<const TurboQuantSpace *>(qty_ptr);
+  const auto *pq = static_cast<const TurboQuantPreparedQuery *>(q);
+  const size_t dim = space->dim();
   const uint8_t *packed = reinterpret_cast<const uint8_t *>(code_buf);
-  const float *meta = reinterpret_cast<const float *>(code_buf + dim);
+  const float *meta = reinterpret_cast<const float *>(
+      static_cast<const char *>(code_buf) + dim);
   const float x_norm = meta[0];
   const float gamma = meta[1];
   const float sigma = meta[2];
@@ -748,7 +651,7 @@ static float distSearchSSE(const TurboQuantPreparedQuery *pq,
     dot_qjl += s_q[i] * ((packed[i] & 1) ? 1.0f : -1.0f);
   }
 
-  const float correction = tqsScale(space) * gamma * dot_qjl;
+  const float correction = space->scale() * gamma * dot_qjl;
   const float ip = (ip_mse + correction) * x_norm * pq->q_norm;
   return std::max(0.0f, pq->q_norm_sq + x_norm * x_norm - 2.0f * ip);
 }
@@ -756,8 +659,8 @@ static float distSearchSSE(const TurboQuantPreparedQuery *pq,
 static float distBuildSSE(const void *pVect1, const void *pVect2,
                           const void *param_ptr) {
   const auto *space = static_cast<const TurboQuantSpace *>(param_ptr);
-  const size_t dim = tqsDim(space);
-  const float *centroids = tqsCentroids(space);
+  const size_t dim = space->dim();
+  const float *centroids = space->centroids();
 
   const char *buf_a = static_cast<const char *>(pVect1);
   const char *buf_b = static_cast<const char *>(pVect2);
@@ -812,11 +715,14 @@ static float distBuildSSE(const void *pVect1, const void *pVect2,
 // ---------------------------------------------------------------------------
 #if defined(USE_AVX)
 
-static float distSearchAVX(const TurboQuantPreparedQuery *pq,
-                           const char *code_buf, const TurboQuantSpace *space) {
-  const size_t dim = tqsDim(space);
+static float distSearchAVX(const void *q, const void *code_buf,
+                           const void *qty_ptr) {
+  const auto *space = static_cast<const TurboQuantSpace *>(qty_ptr);
+  const auto *pq = static_cast<const TurboQuantPreparedQuery *>(q);
+  const size_t dim = space->dim();
   const uint8_t *packed = reinterpret_cast<const uint8_t *>(code_buf);
-  const float *meta = reinterpret_cast<const float *>(code_buf + dim);
+  const float *meta = reinterpret_cast<const float *>(
+      static_cast<const char *>(code_buf) + dim);
   const float x_norm = meta[0];
   const float gamma = meta[1];
   const float sigma = meta[2];
@@ -892,7 +798,7 @@ static float distSearchAVX(const TurboQuantPreparedQuery *pq,
     dot_qjl += s_q[i] * ((packed[i] & 1) ? 1.0f : -1.0f);
   }
 
-  const float correction = tqsScale(space) * gamma * dot_qjl;
+  const float correction = space->scale() * gamma * dot_qjl;
   const float ip = (ip_mse + correction) * x_norm * pq->q_norm;
   return std::max(0.0f, pq->q_norm_sq + x_norm * x_norm - 2.0f * ip);
 }
@@ -900,8 +806,8 @@ static float distSearchAVX(const TurboQuantPreparedQuery *pq,
 static float distBuildAVX(const void *pVect1, const void *pVect2,
                           const void *param_ptr) {
   const auto *space = static_cast<const TurboQuantSpace *>(param_ptr);
-  const size_t dim = tqsDim(space);
-  const float *centroids = tqsCentroids(space);
+  const size_t dim = space->dim();
+  const float *centroids = space->centroids();
 
   const char *buf_a = static_cast<const char *>(pVect1);
   const char *buf_b = static_cast<const char *>(pVect2);
@@ -1664,7 +1570,7 @@ private:
     // After build() the HNSW still has build dist func.
     // Lazily switch on first search. Safe: setSearchMode just writes
     // two pointers, and concurrent reads of the same value are fine.
-    if (hnsw_->fstdistfunc_ != space_->getSearchDistFunc()) {
+    if (hnsw_->fstdistfunc_ != space_->get_search_dist_func()) {
       const_cast<TurboQuantSpace *>(space_.get())
           ->setSearchMode(*const_cast<HierarchicalNSW<float> *>(hnsw_.get()));
     }

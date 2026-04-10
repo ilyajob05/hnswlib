@@ -10,7 +10,7 @@
 ///   6. Recall@K — L2 ranking preservation
 ///   +  Memory footprint report (informational, no pass/fail)
 
-#include "hnswlib/turbo_quant_space.h"
+#include "hnswlib/space_turbo_quant.h"
 
 #include <algorithm>
 #include <chrono>
@@ -138,24 +138,29 @@ bool test_sq_distortion(int bits_per_coord = 4) {
   uint64_t rot_seed = 42;
   uint64_t qjl_seed = 137;
   auto rot_signs = generateSigns(D, rot_seed);
-  const TurboQuantEncoder enc(D, bits_per_coord, rot_seed, qjl_seed);
+  TurboQuantSpace space(D, bits_per_coord, rot_seed, qjl_seed);
+
+  std::vector<char> buf(TurboQuantCode::codeSizeBytes(D));
 
   double total_mse = 0.0;
   for (size_t i = 0; i < N; ++i) {
-    auto code = enc.encode(embeddings[i].data());
+    space.encodeVector(embeddings[i].data(), buf.data());
+    TurboQuantCode code(buf.data(), D);
 
     // Reconstruct MSE part in rotated space
     std::vector<float> rotated(embeddings[i]);
-    float inv_norm = 1.0f / code.norm_;
+    float inv_norm = 1.0f / code.norm();
     for (size_t j = 0; j < D; ++j)
       rotated[j] *= inv_norm;
     randomizedHadamard(rotated.data(), rot_signs.data(), D);
 
-    std::vector<float> recon(D);
-    code.dequantizeBatch(recon.data(), D);
+    // Dequantize: centroid[sq_idx] * sigma
+    const float *centroids = space.centroids();
+    float sigma = code.sigma();
     float mse = 0.0f;
     for (size_t j = 0; j < D; ++j) {
-      float diff = rotated[j] - recon[j];
+      float recon_j = centroids[code.sqIndex(j)] * sigma;
+      float diff = rotated[j] - recon_j;
       mse += diff * diff;
     }
     mse /= static_cast<float>(D);
@@ -201,13 +206,22 @@ bool test_unbiasedness(int bits_per_coord = 4) {
     float exact_ip = dot(y, x, D);
 
     // Average over multiple QJL seeds to estimate E[⟨y, x̃⟩]
+    // Use distSearch to compute L2, then recover IP:
+    //   L2 = ||y||^2 + ||x||^2 - 2*IP  =>  IP = (||y||^2 + ||x||^2 - L2) / 2
+    float y_norm_sq = dot(y, y, D);
+    float x_norm_sq = dot(x, x, D);
+
     double avg_approx = 0.0;
     for (size_t s = 0; s < NUM_SEEDS; ++s) {
-      TurboQuantEncoder enc(D, bits_per_coord, /*rot_seed=*/42,
+      TurboQuantSpace space(D, bits_per_coord, /*rot_seed=*/42,
                             /*qjl_seed=*/1000 + s);
-      auto code = enc.encode(x);
-      float approx = enc.asymmetricInnerProduct(y, code);
-      avg_approx += approx;
+      std::vector<char> buf(TurboQuantCode::codeSizeBytes(D));
+      space.encodeVector(x, buf.data());
+      auto pq = space.prepareQuery(y);
+      auto dist_func = space.get_search_dist_func();
+      float l2 = dist_func(&pq, buf.data(), &space);
+      float approx_ip = (y_norm_sq + x_norm_sq - l2) / 2.0f;
+      avg_approx += approx_ip;
     }
     avg_approx /= NUM_SEEDS;
 
@@ -249,9 +263,11 @@ bool test_lossless_identity(int bits_per_coord = 4) {
   uint64_t rot_seed = 42;
   uint64_t qjl_seed = 137;
   auto rot_signs = generateSigns(D, rot_seed);
+  TurboQuantSpace space(D, bits_per_coord, rot_seed, qjl_seed);
+  const float *centroids = space.centroids();
 
+  std::vector<char> buf(TurboQuantCode::codeSizeBytes(D));
   double max_err = 0.0;
-  const TurboQuantEncoder enc(D, bits_per_coord, rot_seed, qjl_seed);
 
   for (size_t i = 0; i < N; ++i) {
     for (size_t j = i + 1; j < std::min(N, i + 5); ++j) {
@@ -259,10 +275,12 @@ bool test_lossless_identity(int bits_per_coord = 4) {
       const float *y = embeddings[j].data();
       float exact_ip = dot(x, y, D);
 
-      auto code = enc.encode(x);
+      space.encodeVector(x, buf.data());
+      TurboQuantCode code(buf.data(), D);
 
       // Compute MSE IP in rotated space
-      float x_norm = code.norm_;
+      float x_norm = code.norm();
+      float sigma = code.sigma();
       float y_norm_sq = 0.0f;
       for (size_t k = 0; k < D; ++k)
         y_norm_sq += y[k] * y[k];
@@ -281,13 +299,12 @@ bool test_lossless_identity(int bits_per_coord = 4) {
         x_rot[k] = x[k] * x_inv;
       randomizedHadamard(x_rot.data(), rot_signs.data(), D);
 
-      std::vector<float> cv(D);
-      code.dequantizeBatch(cv.data(), D);
       float ip_mse = 0.0f;
       float ip_res = 0.0f;
       for (size_t k = 0; k < D; ++k) {
-        ip_mse += y_rot[k] * cv[k];
-        ip_res += y_rot[k] * (x_rot[k] - cv[k]);
+        float cv_k = centroids[code.sqIndex(k)] * sigma;
+        ip_mse += y_rot[k] * cv_k;
+        ip_res += y_rot[k] * (x_rot[k] - cv_k);
       }
       float reconstructed = (ip_mse + ip_res) * x_norm * y_norm;
       double err = std::abs(reconstructed - exact_ip);
@@ -322,25 +339,32 @@ bool test_ip_correlation(int bits_per_coord = 4) {
   auto embeddings = generateFaceEmbeddings(N, D);
   uint64_t rot_seed = 42;
   uint64_t qjl_seed = 137;
-  const TurboQuantEncoder enc(D, bits_per_coord, rot_seed, qjl_seed);
+  TurboQuantSpace space(D, bits_per_coord, rot_seed, qjl_seed);
 
-  std::vector<TurboQuantCode> codes(N);
+  size_t code_size = TurboQuantCode::codeSizeBytes(D);
+  std::vector<std::vector<char>> codes(N, std::vector<char>(code_size));
   for (size_t i = 0; i < N; ++i) {
-    codes[i] = enc.encode(embeddings[i].data());
+    space.encodeVector(embeddings[i].data(), codes[i].data());
   }
 
   double sum_corr = 0.0;
   std::mt19937_64 rng(999);
   std::uniform_int_distribution<size_t> query_dist(0, N - 1);
+  auto dist_func = space.get_search_dist_func();
 
   for (size_t q = 0; q < NUM_QUERIES; ++q) {
     size_t qi = query_dist(rng);
     const float *query = embeddings[qi].data();
+    auto pq = space.prepareQuery(query);
+    float q_norm_sq = dot(query, query, D);
 
     std::vector<float> exact_ips(N), approx_ips(N);
     for (size_t i = 0; i < N; ++i) {
       exact_ips[i] = dot(query, embeddings[i].data(), D);
-      approx_ips[i] = enc.asymmetricInnerProduct(query, codes[i]);
+      // Recover IP from L2: IP = (||q||^2 + ||x||^2 - L2) / 2
+      float x_norm_sq = dot(embeddings[i].data(), embeddings[i].data(), D);
+      float l2 = dist_func(&pq, codes[i].data(), &space);
+      approx_ips[i] = (q_norm_sq + x_norm_sq - l2) / 2.0f;
     }
 
     // Pearson correlation
@@ -394,12 +418,15 @@ bool test_recall_at_k(int bits_per_coord = 4) {
   auto embeddings = generateFaceEmbeddings(N, D, 100);
   uint64_t rot_seed = 42;
   uint64_t qjl_seed = 137;
-  const TurboQuantEncoder enc(D, bits_per_coord, rot_seed, qjl_seed);
+  TurboQuantSpace space(D, bits_per_coord, rot_seed, qjl_seed);
 
-  std::vector<TurboQuantCode> codes(N);
+  size_t code_size = TurboQuantCode::codeSizeBytes(D);
+  std::vector<std::vector<char>> codes(N, std::vector<char>(code_size));
   for (size_t i = 0; i < N; ++i) {
-    codes[i] = enc.encode(embeddings[i].data());
+    space.encodeVector(embeddings[i].data(), codes[i].data());
   }
+
+  auto dist_func = space.get_search_dist_func();
 
   std::mt19937_64 rng(777);
   std::uniform_int_distribution<size_t> query_dist(0, N - 1);
@@ -409,6 +436,7 @@ bool test_recall_at_k(int bits_per_coord = 4) {
   for (size_t q = 0; q < NUM_QUERIES; ++q) {
     size_t qi = query_dist(rng);
     const float *query = embeddings[qi].data();
+    auto pq = space.prepareQuery(query);
 
     // Exact top-K
     std::vector<std::pair<float, size_t>> exact_dists(N);
@@ -421,7 +449,7 @@ bool test_recall_at_k(int bits_per_coord = 4) {
     // Approximate top-K
     std::vector<std::pair<float, size_t>> approx_dists(N);
     for (size_t i = 0; i < N; ++i) {
-      approx_dists[i] = {enc.asymmetricL2(query, codes[i]), i};
+      approx_dists[i] = {dist_func(&pq, codes[i].data(), &space), i};
     }
     std::partial_sort(approx_dists.begin(), approx_dists.begin() + K,
                       approx_dists.end());
@@ -460,20 +488,19 @@ void test_memory_footprint() {
   std::cout << "=== Memory footprint ===" << std::endl;
 
   constexpr size_t D = 128;
-  uint64_t rot_seed = 42;
-  uint64_t qjl_seed = 137;
-  const TurboQuantEncoder enc(D, 8, rot_seed, qjl_seed);
+  constexpr int BITS = 8;
 
   size_t raw_bytes = D * sizeof(float);
-  size_t tq_bytes = enc.codeSizeBytes();
+  size_t tq_bytes = TurboQuantCode::codeSizeBytes(D);
+  int mse_bits = BITS - 1;
 
   std::cout << "  Dimension:       " << D << std::endl;
-  std::cout << "  Bit budget:      " << enc.totalBits()
-            << " (MSE: " << enc.mseBits() << " + QJL: 1)" << std::endl;
+  std::cout << "  Bit budget:      " << BITS
+            << " (MSE: " << mse_bits << " + QJL: 1)" << std::endl;
   std::cout << "  Raw float32:     " << raw_bytes << " bytes" << std::endl;
   std::cout << "  TurboQuant code: " << tq_bytes << " bytes" << std::endl;
   std::cout << "  Effective bpc:   " << std::fixed << std::setprecision(1)
-            << enc.effectiveBitsPerCoord() << " bits/coord" << std::endl;
+            << static_cast<float>(tq_bytes * 8) / D << " bits/coord" << std::endl;
   std::cout << "  Compression:     " << std::setprecision(1)
             << static_cast<float>(raw_bytes) / tq_bytes << "x" << std::endl;
   std::cout << "  Per 1M vectors:  " << std::setprecision(0)
@@ -481,7 +508,7 @@ void test_memory_footprint() {
             << (tq_bytes * 1e6 / (1024.0 * 1024.0)) << " MB" << std::endl;
 
   // Tight bit-packed estimate (if SQ indices were sub-byte packed)
-  size_t tight_sq = (D * enc.mseBits() + 7) / 8;
+  size_t tight_sq = (D * mse_bits + 7) / 8;
   size_t tight_qjl = (D + 7) / 8;
   size_t tight_total = tight_sq + tight_qjl + sizeof(float) * 3;
   std::cout << "\n  Tight bit-packed estimate: " << tight_total << " bytes ("
@@ -494,8 +521,8 @@ void test_memory_footprint() {
 // ---------------------------------------------------------------------------
 // Test 6: Serialization round-trip
 // ---------------------------------------------------------------------------
-bool test_serialization_roundtrip(int bits_per_coord = 4) {
-  std::cout << "=== Test 6: Serialization round-trip (b=" << bits_per_coord
+bool test_encode_determinism(int bits_per_coord = 4) {
+  std::cout << "=== Test 6: Encode determinism (b=" << bits_per_coord
             << ") ===" << std::endl;
 
   constexpr size_t D = 128;
@@ -504,55 +531,43 @@ bool test_serialization_roundtrip(int bits_per_coord = 4) {
   auto embeddings = generateFaceEmbeddings(N, D);
   uint64_t rot_seed = 42;
   uint64_t qjl_seed = 137;
-  const TurboQuantEncoder enc(D, bits_per_coord, rot_seed, qjl_seed);
+  TurboQuantSpace space(D, bits_per_coord, rot_seed, qjl_seed);
 
-  double max_err = 0.0;
+  size_t code_size = TurboQuantCode::codeSizeBytes(D);
   bool all_match = true;
 
   for (size_t i = 0; i < N; ++i) {
-    auto code = enc.encode(embeddings[i].data());
+    std::vector<char> buf1(code_size), buf2(code_size);
+    space.encodeVector(embeddings[i].data(), buf1.data());
+    space.encodeVector(embeddings[i].data(), buf2.data());
 
-    // Serialize
-    std::vector<char> buf(TurboQuantCode::codeSizeBytes(D));
-    code.serializeTo(buf.data(), D);
-
-    // Deserialize
-    auto code3 =
-        TurboQuantCode::deserializeFrom(buf.data(), D, code.boundaries(),
-                                        code.numBoundaries(), code.centroids());
-
-    // Check fields match
-    if (code3.norm_ != code.norm_ || code3.gamma_ != code.gamma_ ||
-        code3.sigma_ != code.sigma_) {
+    if (std::memcmp(buf1.data(), buf2.data(), code_size) != 0) {
       all_match = false;
       break;
-    }
-    if (code3.sq_packed_ != code.sq_packed_ ||
-        code3.qjl_signs_ != code.qjl_signs_) {
-      all_match = false;
-      break;
-    }
-
-    // Verify dequantized values match
-    std::vector<float> recon1(D), recon2(D);
-    code.dequantizeBatch(recon1.data(), D);
-    code3.dequantizeBatch(recon2.data(), D);
-    for (size_t j = 0; j < D; ++j) {
-      double err = std::abs(recon1[j] - recon2[j]);
-      max_err = std::max(max_err, err);
     }
   }
 
-  bool pass = all_match && (max_err < 1e-10);
-  std::cout << "  Fields match: " << (all_match ? "yes" : "NO")
-            << ", max dequant err: " << std::scientific << max_err;
-  if (!pass) {
+  // Also verify two spaces with same seeds produce identical codes
+  TurboQuantSpace space2(D, bits_per_coord, rot_seed, qjl_seed);
+  for (size_t i = 0; i < N && all_match; ++i) {
+    std::vector<char> buf1(code_size), buf2(code_size);
+    space.encodeVector(embeddings[i].data(), buf1.data());
+    space2.encodeVector(embeddings[i].data(), buf2.data());
+
+    if (std::memcmp(buf1.data(), buf2.data(), code_size) != 0) {
+      all_match = false;
+      break;
+    }
+  }
+
+  std::cout << "  Deterministic encoding: " << (all_match ? "yes" : "NO");
+  if (!all_match) {
     std::cout << "  FAIL";
   } else {
     std::cout << "  PASS";
   }
   std::cout << std::endl;
-  return pass;
+  return all_match;
 }
 
 // ---------------------------------------------------------------------------
@@ -1005,80 +1020,34 @@ void test_benchmark() {
   auto embeddings = generateFaceEmbeddings(N, D, 50);
   uint64_t rot_seed = 42;
   uint64_t qjl_seed = 137;
-  const TurboQuantEncoder enc(D, 8, rot_seed, qjl_seed);
+  TurboQuantSpace space(D, 8, rot_seed, qjl_seed);
+
+  size_t code_size = TurboQuantCode::codeSizeBytes(D);
+  std::vector<std::vector<char>> codes(N, std::vector<char>(code_size));
 
   // 1. Encode throughput
-  std::vector<TurboQuantCode> codes(N);
   auto t0 = std::chrono::high_resolution_clock::now();
   for (size_t i = 0; i < N; ++i) {
-    codes[i] = enc.encode(embeddings[i].data());
+    space.encodeVector(embeddings[i].data(), codes[i].data());
   }
   auto t1 = std::chrono::high_resolution_clock::now();
   double encode_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
 
-  // 2. DequantizeBatch throughput
-  std::vector<float> recon(D);
-  t0 = std::chrono::high_resolution_clock::now();
-  for (size_t i = 0; i < N; ++i) {
-    codes[i].dequantizeBatch(recon.data(), D);
-  }
-  t1 = std::chrono::high_resolution_clock::now();
-  double dequant_us =
-      std::chrono::duration<double, std::micro>(t1 - t0).count();
-
-  // 3. AsymmetricL2 (naive) — includes 2 RHT per comparison
-  t0 = std::chrono::high_resolution_clock::now();
-  volatile float sink = 0.0f;
-  for (size_t q = 0; q < NUM_QUERIES; ++q) {
-    for (size_t i = 0; i < N; ++i) {
-      sink = enc.asymmetricL2(embeddings[q].data(), codes[i]);
-    }
-  }
-  t1 = std::chrono::high_resolution_clock::now();
-  double naive_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
-  size_t naive_total = NUM_QUERIES * N;
-
-  // 4. Serialization round-trip
-  std::vector<std::vector<char>> buffers(
-      N, std::vector<char>(TurboQuantCode::codeSizeBytes(D)));
-  t0 = std::chrono::high_resolution_clock::now();
-  for (size_t i = 0; i < N; ++i) {
-    codes[i].serializeTo(buffers[i].data(), D);
-  }
-  t1 = std::chrono::high_resolution_clock::now();
-  double ser_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
-
-  t0 = std::chrono::high_resolution_clock::now();
-  for (size_t i = 0; i < N; ++i) {
-    auto c = TurboQuantCode::deserializeFrom(
-        buffers[i].data(), D, codes[0].boundaries(), codes[0].numBoundaries(),
-        codes[0].centroids());
-    (void)c;
-  }
-  t1 = std::chrono::high_resolution_clock::now();
-  double deser_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
-
-  // 5. Prepared-query L2 (fast path — no RHT per candidate)
-  TurboQuantSpace space(D, 4, rot_seed, qjl_seed);
-  // Encode into flat buffers via space
-  std::vector<std::vector<char>> flat_codes(
-      N, std::vector<char>(space.codeSizeBytes()));
-  for (size_t i = 0; i < N; ++i) {
-    space.encodeVector(embeddings[i].data(), flat_codes[i].data());
-  }
-
-  t0 = std::chrono::high_resolution_clock::now();
-  auto dist_func = space.getSearchDistFunc();
+  // 2. Distance computation throughput (prepared query)
+  auto dist_func = space.get_search_dist_func();
   auto *dist_param = space.get_dist_func_param();
+  size_t total_comps = NUM_QUERIES * N;
+
+  volatile float sink = 0.0f;
+  t0 = std::chrono::high_resolution_clock::now();
   for (size_t q = 0; q < NUM_QUERIES; ++q) {
     auto pq = space.prepareQuery(embeddings[q].data());
     for (size_t i = 0; i < N; ++i) {
-      sink = dist_func(&pq, flat_codes[i].data(), dist_param);
+      sink = dist_func(&pq, codes[i].data(), dist_param);
     }
   }
   t1 = std::chrono::high_resolution_clock::now();
-  double prepared_us =
-      std::chrono::duration<double, std::micro>(t1 - t0).count();
+  double dist_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
   (void)sink;
 
   // Report
@@ -1086,26 +1055,10 @@ void test_benchmark() {
   std::cout << "  encode:            " << std::setw(8) << (encode_us / N)
             << " us/vec  (" << static_cast<size_t>(N * 1e6 / encode_us)
             << " vec/s)" << std::endl;
-  std::cout << "  dequantizeBatch:   " << std::setw(8) << (dequant_us / N)
-            << " us/vec  (" << static_cast<size_t>(N * 1e6 / dequant_us)
-            << " vec/s)" << std::endl;
-  std::cout << "  asymmetricL2:      " << std::setw(8)
-            << (naive_us / naive_total * 1000.0) << " ns/cmp  ("
-            << static_cast<size_t>(naive_total * 1e6 / naive_us) << " cmp/s)"
+  std::cout << "  distSearch:        " << std::setw(8)
+            << (dist_us / total_comps * 1000.0) << " ns/cmp  ("
+            << static_cast<size_t>(total_comps * 1e6 / dist_us) << " cmp/s)"
             << std::endl;
-  std::cout << "  serialize:         " << std::setw(8) << (ser_us / N * 1000.0)
-            << " ns/op   (" << static_cast<size_t>(N * 1e6 / ser_us) << " op/s)"
-            << std::endl;
-  std::cout << "  deserialize:       " << std::setw(8)
-            << (deser_us / N * 1000.0) << " ns/op   ("
-            << static_cast<size_t>(N * 1e6 / deser_us) << " op/s)" << std::endl;
-  std::cout << "  preparedL2:        " << std::setw(8)
-            << (prepared_us / naive_total * 1000.0) << " ns/cmp  ("
-            << static_cast<size_t>(naive_total * 1e6 / prepared_us) << " cmp/s)"
-            << std::endl;
-  double speedup = naive_us / prepared_us;
-  std::cout << "  speedup (prepared vs naive): " << std::setprecision(2)
-            << speedup << "x" << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -1135,7 +1088,7 @@ bool test_lut_correctness(int bits_per_coord = 4) {
 
   // Reference: compute distance using direct formula
   // ip_mse_ref = sigma * Σ_i q_rot[i] * centroids[sq_packed[i]]
-  const float *centroids = tq_space.encoder().centroids();
+  const float *centroids = tq_space.centroids();
 
   float max_rel_err = 0.0f;
   int mismatches = 0;
@@ -1159,7 +1112,7 @@ bool test_lut_correctness(int bits_per_coord = 4) {
         ip_mse_ref += pq.q_rot[d] * centroids[packed[d] >> 1] * sigma;
 
       // Verify full distance via TurboQuantSpace search dispatch
-      float dist_dispatch = tq_space.getSearchDistFunc()(&pq, buf,
+      float dist_dispatch = tq_space.get_search_dist_func()(&pq, buf,
                                                           tq_space.get_dist_func_param());
 
       // Reference full distance
@@ -1547,7 +1500,7 @@ int main() {
     run(test_lossless_identity(b));
     run(test_ip_correlation(b));
     run(test_recall_at_k(b));
-    run(test_serialization_roundtrip(b));
+    run(test_encode_determinism(b));
     run(test_hnsw_integration(b));
     run(test_save_load_index(b));
     run(test_lut_correctness(b));

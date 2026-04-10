@@ -9,7 +9,7 @@
 ///   6. Re-rank shortlist using exact L2 from saved raw vectors
 ///   7. Load compressed index from disk and verify
 
-#include "../../hnswlib/turbo_quant_space.h"
+#include "../../hnswlib/space_turbo_quant.h"
 
 #include <algorithm>
 #include <chrono>

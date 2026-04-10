@@ -5,7 +5,7 @@
 /// Requires BigANN data files in bigann/ directory
 /// (run tests/cpp/download_bigann.py first).
 
-#include "hnswlib/turbo_quant_space.h"
+#include "hnswlib/space_turbo_quant.h"
 
 #include <algorithm>
 #include <chrono>
@@ -515,7 +515,7 @@ int main(int argc, char **argv) {
       for (size_t i = 0; i < BF_N; ++i)
         tqspace.encodeVector(bf_base[i].data(), codes[i].data());
 
-      auto dist_func = tqspace.getSearchDistFunc();
+      auto dist_func = tqspace.get_search_dist_func();
       auto *dist_param = tqspace.get_dist_func_param();
 
       size_t total_hits = 0;
@@ -621,7 +621,7 @@ int main(int argc, char **argv) {
       std::cout << std::endl;
 
       // TQ brute-force recall at this scale
-      auto dist_func = tqspace.getSearchDistFunc();
+      auto dist_func = tqspace.get_search_dist_func();
       auto *dist_param = tqspace.get_dist_func_param();
 
       std::vector<std::vector<char>> codes(

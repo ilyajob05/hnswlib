@@ -4,7 +4,7 @@
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 #include "hnswlib.h"
-#include "turbo_quant_space.h"
+#include "space_turbo_quant.h"
 #include <thread>
 #include <atomic>
 #include <stdlib.h>
