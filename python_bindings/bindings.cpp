@@ -1309,4 +1309,4 @@ PYBIND11_PLUGIN(hnswlib) {
         });
 
         return m.ptr();
-}
+};

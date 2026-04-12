@@ -26,7 +26,6 @@
 #include <cstring>
 #include <fstream>
 #include <memory>
-#include <thread>
 
 #ifndef _WIN32
 #include <fcntl.h>
@@ -147,7 +146,6 @@ static float distSearchScalar(const void *q, const void *code_buf, const void *q
 static float distBuildScalar(const void *pVect1, const void *pVect2, const void *param_ptr);
 static float distSearchScalarB4(const void *q, const void *code_buf, const void *qty_ptr);
 static float distBuildScalarB4(const void *pVect1, const void *pVect2, const void *param_ptr);
-static float distBuildScalar(const void *pVect1, const void *pVect2, const void *param_ptr);
 
 #if defined(USE_NEON)
 static float distSearchNEON(const void *q, const void *code_buf, const void *qty_ptr);
@@ -192,7 +190,7 @@ public:
     TurboQuantSpace(size_t dim,
                     int bits_per_coord = 4,
                     uint64_t rot_seed = 42,
-                    uint64_t qjl_seed = 271)
+                    uint64_t qjl_seed = 137)
         : rot_seed_(rot_seed)
         , qjl_seed_(qjl_seed)
         , dim_(dim)
@@ -321,7 +319,7 @@ public:
             gamma_sq += residual[i] * residual[i];
         float gamma = std::sqrt(gamma_sq);
 
-        // Step 6: QJL projection → pack units into output buffer.
+        // Step 6: QJL projection -> pack units into output buffer.
         //   unit[i] = (sq_idx[i] << 1) | (residual[i] >= 0)
         randomizedHadamard(residual.data(), qjl_signs_precomp_.data(), dim_);
         uint8_t *out = code.sq_packed_;

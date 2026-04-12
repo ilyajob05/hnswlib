@@ -17,7 +17,7 @@ import numpy as np
 # Dataset / graph parameters
 # ---------------------------------------------------------------------------
 
-DIM = 128
+DIM = 512
 NUM_ELEMENTS = 100_000
 NUM_QUERIES = 1_000
 K = 10
