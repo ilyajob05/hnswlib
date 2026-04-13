@@ -945,7 +945,8 @@ class TQIndex {
         num_threads_default = std::thread::hardware_concurrency();
     }
 
-    void build(py::object input, size_t M = 16, size_t ef_construction = 200, int num_threads = -1) {
+    void build(py::object input, size_t M = 16, size_t ef_construction = 200,
+               int num_threads = -1, bool use_corrected_build = false) {
         py::array_t<float, py::array::c_style | py::array::forcecast> items(input);
         auto buffer = items.request();
         size_t rows, features;
@@ -960,7 +961,7 @@ class TQIndex {
         {
             py::gil_scoped_release l;
 
-            tq_index.initBuild(rows, M, ef_construction);
+            tq_index.initBuild(rows, M, ef_construction, use_corrected_build);
             size_t code_size = tq_index.codeSizeBytes();
 
             // First element single-threaded (entry point)
@@ -1141,6 +1142,163 @@ class TQIndex {
     size_t get_current_count() { return tq_index.numElements(); }
     bool get_has_raw_vectors() { return tq_index.hasRawVectors(); }
     size_t get_code_size() { return tq_index.codeSizeBytes(); }
+
+    /// Return Lloyd-Max quantization table: dict with "centroids" and "boundaries"
+    py::dict get_lloyd_max_table() {
+        auto *space = tq_index.space();
+        if (!space)
+            HNSWLIB_THROW_RUNTIME_ERROR("Index not built yet");
+
+        // Recompute the table to get boundaries too
+        int bits = space->bitsPerCoord();
+        auto table = hnswlib::turboquant::computeLloydMax(bits - 1);
+
+        py::dict result;
+        result["centroids"] = py::array_t<float>(
+            {static_cast<py::ssize_t>(table.centroids.size())},
+            table.centroids.data());
+        result["boundaries"] = py::array_t<float>(
+            {static_cast<py::ssize_t>(table.boundaries.size())},
+            table.boundaries.data());
+        result["bits_sq"] = bits - 1;
+        result["num_levels"] = static_cast<int>(table.centroids.size());
+        return result;
+    }
+
+    /// Encode vectors and return post-RHT distribution statistics.
+    /// Returns rotated coordinates for analysis of the distribution.
+    py::array_t<float> get_post_rht_coords(py::object input, size_t max_vectors = 1000) {
+        py::array_t<float, py::array::c_style | py::array::forcecast> items(input);
+        auto buffer = items.request();
+        size_t rows, features;
+        get_input_array_shapes(buffer, &rows, &features);
+        if (features != dim)
+            HNSWLIB_THROW_RUNTIME_ERROR("Wrong dimensionality");
+
+        if (rows > max_vectors) rows = max_vectors;
+
+        // We need to replicate the encoding steps up to the RHT stage
+        auto *space = tq_index.space();
+        if (!space)
+            HNSWLIB_THROW_RUNTIME_ERROR("Index not built yet");
+
+        // Allocate output: rows × dim of normalized+RHT coordinates (before quantization)
+        auto *out = new float[rows * dim];
+
+        {
+            py::gil_scoped_release l;
+            auto signs = hnswlib::turboquant::generateSigns(dim, space->rotSeed());
+            for (size_t r = 0; r < rows; ++r) {
+                const float *raw = items.data(r);
+                // Step 1: norm
+                float norm_sq = 0.0f;
+                for (size_t i = 0; i < dim; ++i)
+                    norm_sq += raw[i] * raw[i];
+                float norm = std::sqrt(norm_sq);
+                float inv_norm = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;
+
+                // Step 2: normalize + RHT
+                float *rotated = out + r * dim;
+                for (size_t i = 0; i < dim; ++i)
+                    rotated[i] = raw[i] * inv_norm;
+                hnswlib::turboquant::randomizedHadamard(rotated, signs.data(), dim);
+
+                // Step 3: normalize by sigma
+                float var = 0.0f;
+                for (size_t i = 0; i < dim; ++i)
+                    var += rotated[i] * rotated[i];
+                float sigma = std::sqrt(var / static_cast<float>(dim));
+                if (sigma < 1e-10f) sigma = 1e-10f;
+                for (size_t i = 0; i < dim; ++i)
+                    rotated[i] /= sigma;
+            }
+        }
+
+        py::capsule free_out(out, [](void *f) { delete[] static_cast<float*>(f); });
+        return py::array_t<float>(
+            {static_cast<py::ssize_t>(rows), static_cast<py::ssize_t>(dim)},
+            {static_cast<py::ssize_t>(dim * sizeof(float)), static_cast<py::ssize_t>(sizeof(float))},
+            out, free_out);
+    }
+
+    /// Diagnostic: compute pairwise distances using different distance functions.
+    /// Returns dict with keys "l2", "dist_build", "dist_build_corrected", "dist_search"
+    /// each containing a float array of distances for the given pairs.
+    /// pairs: Nx2 array of integer indices into the index.
+    /// raw_data: the original float vectors (NxD), needed for L2 and distSearch.
+    py::dict compute_distances(py::object pairs_obj, py::object raw_data_obj) {
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> pairs(pairs_obj);
+        py::array_t<float, py::array::c_style | py::array::forcecast> raw_data(raw_data_obj);
+        auto pairs_buf = pairs.request();
+        auto raw_buf = raw_data.request();
+
+        if (pairs_buf.ndim != 2 || pairs_buf.shape[1] != 2)
+            HNSWLIB_THROW_RUNTIME_ERROR("pairs must be Nx2");
+        if (raw_buf.ndim != 2 || static_cast<size_t>(raw_buf.shape[1]) != dim)
+            HNSWLIB_THROW_RUNTIME_ERROR("raw_data dimension mismatch");
+
+        size_t n_pairs = pairs_buf.shape[0];
+        const int64_t *pair_data = pairs.data(0);
+        const float *raw = raw_data.data(0);
+
+        auto *d_l2 = new float[n_pairs];
+        auto *d_build = new float[n_pairs];
+        auto *d_build_corr = new float[n_pairs];
+        auto *d_search = new float[n_pairs];
+
+        {
+            py::gil_scoped_release l;
+
+            auto *space = tq_index.space();
+            auto *hnsw_ptr = tq_index.hnsw();
+
+            auto dist_build = space->get_dist_func();
+            auto dist_build_corrected_fn = space->getBuildCorrectedFunc();
+            auto dist_search = space->get_search_dist_func();
+
+            for (size_t p = 0; p < n_pairs; ++p) {
+                int64_t i = pair_data[p * 2];
+                int64_t j = pair_data[p * 2 + 1];
+
+                // True L2
+                const float *vi = raw + i * dim;
+                const float *vj = raw + j * dim;
+                float l2 = 0.0f;
+                for (size_t d = 0; d < dim; ++d) {
+                    float diff = vi[d] - vj[d];
+                    l2 += diff * diff;
+                }
+                d_l2[p] = l2;
+
+                // Get encoded data from HNSW
+                const void *code_i = hnsw_ptr->getDataByInternalId(i);
+                const void *code_j = hnsw_ptr->getDataByInternalId(j);
+
+                // distBuild (SQ-only, no QJL correction)
+                d_build[p] = dist_build(code_i, code_j, space);
+
+                // distBuildCorrected (SQ + QJL cross-term)
+                d_build_corr[p] = dist_build_corrected_fn(code_i, code_j, space);
+
+                // distSearch (asymmetric: prepareQuery × code)
+                auto pq = space->prepareQuery(vi);
+                d_search[p] = dist_search(&pq, code_j, space);
+            }
+        }
+
+        py::capsule free_l2(d_l2, [](void *f) { delete[] static_cast<float*>(f); });
+        py::capsule free_build(d_build, [](void *f) { delete[] static_cast<float*>(f); });
+        py::capsule free_corr(d_build_corr, [](void *f) { delete[] static_cast<float*>(f); });
+        py::capsule free_search(d_search, [](void *f) { delete[] static_cast<float*>(f); });
+
+        py::dict result;
+        py::ssize_t np = static_cast<py::ssize_t>(n_pairs);
+        result["l2"] = py::array_t<float>({np}, d_l2, free_l2);
+        result["dist_build"] = py::array_t<float>({np}, d_build, free_build);
+        result["dist_build_corrected"] = py::array_t<float>({np}, d_build_corr, free_corr);
+        result["dist_search"] = py::array_t<float>({np}, d_search, free_search);
+        return result;
+    }
 };
 
 
@@ -1258,7 +1416,8 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("data"),
             py::arg("M") = 16,
             py::arg("ef_construction") = 200,
-            py::arg("num_threads") = -1)
+            py::arg("num_threads") = -1,
+            py::arg("use_corrected_build") = false)
         .def("build_from_l2",
             &TQIndex::build_from_l2,
             py::arg("data"),
@@ -1304,6 +1463,14 @@ PYBIND11_PLUGIN(hnswlib) {
         .def_property_readonly("code_size", [](const TQIndex &idx) {
             return idx.tq_index.codeSizeBytes();
         })
+        .def("compute_distances",
+            &TQIndex::compute_distances,
+            py::arg("pairs"),
+            py::arg("raw_data"))
+        .def("get_lloyd_max_table", &TQIndex::get_lloyd_max_table)
+        .def("get_post_rht_coords", &TQIndex::get_post_rht_coords,
+            py::arg("data"),
+            py::arg("max_vectors") = 1000)
         .def("__repr__", [](const TQIndex &a) {
             return "<hnswlib.TQIndex(dim=" + std::to_string(a.dim) + ")>";
         });

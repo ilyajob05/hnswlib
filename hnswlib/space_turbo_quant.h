@@ -146,6 +146,8 @@ static float distSearchScalar(const void *q, const void *code_buf, const void *q
 static float distBuildScalar(const void *pVect1, const void *pVect2, const void *param_ptr);
 static float distSearchScalarB4(const void *q, const void *code_buf, const void *qty_ptr);
 static float distBuildScalarB4(const void *pVect1, const void *pVect2, const void *param_ptr);
+static float distBuildCorrectedScalar(const void *pVect1, const void *pVect2, const void *param_ptr);
+static float distBuildCorrectedScalarB4(const void *pVect1, const void *pVect2, const void *param_ptr);
 
 #if defined(USE_NEON)
 static float distSearchNEON(const void *q, const void *code_buf, const void *qty_ptr);
@@ -184,6 +186,7 @@ class TurboQuantSpace : public SpaceInterface<float> {
     const float scale_;
     DISTFUNC<float> fstdistfunc_;
     DISTFUNC<float> fstdistfunc_build_;
+    DISTFUNC<float> fstdistfunc_build_corrected_;
     DISTFUNC<float> fstdistfunc_search_;
 
 public:
@@ -224,6 +227,7 @@ public:
             fstdistfunc_build_ = distBuildScalarB4;
             fstdistfunc_search_ = distSearchScalarB4;
 #endif
+            fstdistfunc_build_corrected_ = distBuildCorrectedScalarB4;
         } else {
 #if defined(USE_AVX)
             fstdistfunc_ = distBuildAVX;
@@ -242,6 +246,7 @@ public:
             fstdistfunc_build_ = distBuildScalar;
             fstdistfunc_search_ = distSearchScalar;
 #endif
+            fstdistfunc_build_corrected_ = distBuildCorrectedScalar;
         }
 
         lm_table_ = computeLloydMax(bits_per_coord - 1);
@@ -259,6 +264,9 @@ public:
 
     // Search distance function (asymmetric: PreparedQuery × code)
     DISTFUNC<float> get_search_dist_func() const { return fstdistfunc_search_; }
+
+    // Build corrected distance function (code × code with QJL cross-term)
+    DISTFUNC<float> getBuildCorrectedFunc() const { return fstdistfunc_build_corrected_; }
 
     // Accessors
     size_t dim() const { return dim_; }
@@ -377,6 +385,12 @@ public:
         hnsw.dist_func_param_ = this;
     }
 
+    /// Switch HNSW to corrected build mode: code × code with QJL cross-term.
+    void setCorrectedBuildMode(HierarchicalNSW<float> &hnsw) {
+        hnsw.fstdistfunc_ = fstdistfunc_build_corrected_;
+        hnsw.dist_func_param_ = this;
+    }
+
     // -- Query preparation ----------------------------------------------------
 
     /// Prepare query: amortizes 2 RHT calls across all distance computations.
@@ -490,6 +504,48 @@ static float distBuildScalar(const void *pVect1, const void *pVect2,
   return std::max(0.0f, norm_a * norm_a + norm_b * norm_b - 2.0f * ip);
 }
 
+// distBuildCorrected: code × code with QJL cross-term correction.
+// Adds scale² * gamma_a * gamma_b * Σ sign_a[i]*sign_b[i] to the IP estimate.
+// This uses the stored QJL sign bits to approximate the residual cross-term
+// that plain distBuild ignores.
+static float distBuildCorrectedScalar(const void *pVect1, const void *pVect2,
+                                      const void *param_ptr) {
+  const auto *space = static_cast<const TurboQuantSpace *>(param_ptr);
+  const size_t dim = space->dim();
+  const float *centroids = space->centroids();
+  const float scale = space->scale();
+
+  const char *buf_a = static_cast<const char *>(pVect1);
+  const char *buf_b = static_cast<const char *>(pVect2);
+
+  const uint8_t *packed_a = reinterpret_cast<const uint8_t *>(buf_a);
+  const float *meta_a = reinterpret_cast<const float *>(buf_a + dim);
+  const float norm_a = meta_a[0];
+  const float gamma_a = meta_a[1];
+  const float sigma_a = meta_a[2];
+
+  const uint8_t *packed_b = reinterpret_cast<const uint8_t *>(buf_b);
+  const float *meta_b = reinterpret_cast<const float *>(buf_b + dim);
+  const float norm_b = meta_b[0];
+  const float gamma_b = meta_b[1];
+  const float sigma_b = meta_b[2];
+
+  float ip_rot = 0.0f;
+  float dot_signs = 0.0f;
+  for (size_t i = 0; i < dim; ++i) {
+    ip_rot += (centroids[packed_a[i] >> 1] * sigma_a) *
+              (centroids[packed_b[i] >> 1] * sigma_b);
+    // QJL sign match: +1 if same, -1 if different
+    float sign_a = (packed_a[i] & 1) ? 1.0f : -1.0f;
+    float sign_b = (packed_b[i] & 1) ? 1.0f : -1.0f;
+    dot_signs += sign_a * sign_b;
+  }
+
+  const float correction = scale * scale * gamma_a * gamma_b * dot_signs;
+  const float ip = (ip_rot + correction) * norm_a * norm_b;
+  return std::max(0.0f, norm_a * norm_a + norm_b * norm_b - 2.0f * ip);
+}
+
 // ---------------------------------------------------------------------------
 // Packed-nibble (b<=4) scalar variants
 //   byte[i] holds two 4-bit units: low=coord 2i, high=coord 2i+1
@@ -564,6 +620,54 @@ static float distBuildScalarB4(const void *pVect1, const void *pVect2,
   }
 
   const float ip = ip_rot * norm_a * norm_b;
+  return std::max(0.0f, norm_a * norm_a + norm_b * norm_b - 2.0f * ip);
+}
+
+// distBuildCorrected B4: code × code with QJL cross-term for packed nibbles.
+static float distBuildCorrectedScalarB4(const void *pVect1, const void *pVect2,
+                                        const void *param_ptr) {
+  const auto *space = static_cast<const TurboQuantSpace *>(param_ptr);
+  const size_t dim = space->dim();
+  const size_t packed_bytes = space->packedBytes();
+  const float *centroids = space->centroids();
+  const float scale = space->scale();
+
+  const char *buf_a = static_cast<const char *>(pVect1);
+  const char *buf_b = static_cast<const char *>(pVect2);
+
+  const uint8_t *packed_a = reinterpret_cast<const uint8_t *>(buf_a);
+  const float *meta_a = reinterpret_cast<const float *>(buf_a + packed_bytes);
+  const float norm_a = meta_a[0];
+  const float gamma_a = meta_a[1];
+  const float sigma_a = meta_a[2];
+
+  const uint8_t *packed_b = reinterpret_cast<const uint8_t *>(buf_b);
+  const float *meta_b = reinterpret_cast<const float *>(buf_b + packed_bytes);
+  const float norm_b = meta_b[0];
+  const float gamma_b = meta_b[1];
+  const float sigma_b = meta_b[2];
+
+  float ip_rot = 0.0f;
+  float dot_signs = 0.0f;
+  for (size_t i = 0, bi = 0; i < dim; i += 2, ++bi) {
+    uint8_t ba = packed_a[bi];
+    uint8_t bb = packed_b[bi];
+    uint8_t lo_a = (ba & 0x0F);
+    uint8_t hi_a = (ba >> 4);
+    uint8_t lo_b = (bb & 0x0F);
+    uint8_t hi_b = (bb >> 4);
+    ip_rot += (centroids[lo_a >> 1] * sigma_a) * (centroids[lo_b >> 1] * sigma_b);
+    ip_rot += (centroids[hi_a >> 1] * sigma_a) * (centroids[hi_b >> 1] * sigma_b);
+    // QJL sign cross-term
+    float sa_lo = (lo_a & 1) ? 1.0f : -1.0f;
+    float sb_lo = (lo_b & 1) ? 1.0f : -1.0f;
+    float sa_hi = (hi_a & 1) ? 1.0f : -1.0f;
+    float sb_hi = (hi_b & 1) ? 1.0f : -1.0f;
+    dot_signs += sa_lo * sb_lo + sa_hi * sb_hi;
+  }
+
+  const float correction = scale * scale * gamma_a * gamma_b * dot_signs;
+  const float ip = (ip_rot + correction) * norm_a * norm_b;
   return std::max(0.0f, norm_a * norm_a + norm_b * norm_b - 2.0f * ip);
 }
 
@@ -1702,12 +1806,17 @@ public:
   // -- Build ----------------------------------------------------------------
 
   /// Initialize space and HNSW graph for building. Call addPoint() to populate.
+  /// If use_corrected_build is true, uses distBuildCorrected (with QJL cross-term).
   void initBuild(size_t max_elements, size_t M = 16,
-                 size_t ef_construction = 200) {
+                 size_t ef_construction = 200,
+                 bool use_corrected_build = false) {
     space_.reset(
         new TurboQuantSpace(dim_, bits_per_coord_, rot_seed_, qjl_seed_));
     hnsw_.reset(new HierarchicalNSW<float>(space_.get(), max_elements, M,
                                            ef_construction));
+    if (use_corrected_build) {
+      space_->setCorrectedBuildMode(*hnsw_);
+    }
   }
 
   /// Encode a float vector and add it to the index. Thread-safe (addPoint uses
@@ -1721,8 +1830,9 @@ public:
   /// Build a TQ-compressed HNSW index from raw float vectors (single-threaded).
   /// data[i] points to a float[dim] vector for label i.
   Status build(const float *const *data, size_t n, size_t M = 16,
-               size_t ef_construction = 200) {
-    initBuild(n, M, ef_construction);
+               size_t ef_construction = 200,
+               bool use_corrected_build = false) {
+    initBuild(n, M, ef_construction, use_corrected_build);
 
     std::vector<char> buf(space_->codeSizeBytes());
     for (size_t i = 0; i < n; ++i)
@@ -1733,11 +1843,12 @@ public:
 
   /// Build from contiguous array: data points to n*dim floats, row-major.
   Status build(const float *data, size_t n, size_t M = 16,
-               size_t ef_construction = 200) {
+               size_t ef_construction = 200,
+               bool use_corrected_build = false) {
     std::vector<const float *> ptrs(n);
     for (size_t i = 0; i < n; ++i)
       ptrs[i] = data + i * dim_;
-    return build(ptrs.data(), n, M, ef_construction);
+    return build(ptrs.data(), n, M, ef_construction, use_corrected_build);
   }
 
   // -- L2-graph build path (low-level, for parallel insertion) --------------
@@ -1988,7 +2099,9 @@ public:
   size_t codeSizeBytes() const { return space_ ? space_->codeSizeBytes() : 0; }
 
   const TurboQuantSpace *space() const { return space_.get(); }
+  TurboQuantSpace *space() { return space_.get(); }
   const HierarchicalNSW<float> *hnsw() const { return hnsw_.get(); }
+  HierarchicalNSW<float> *hnsw() { return hnsw_.get(); }
 
 private:
   void ensureSearchMode() const {
