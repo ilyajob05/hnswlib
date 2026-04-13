@@ -186,7 +186,6 @@ class TurboQuantSpace : public SpaceInterface<float> {
     const float scale_;
     DISTFUNC<float> fstdistfunc_;
     DISTFUNC<float> fstdistfunc_build_;
-    DISTFUNC<float> fstdistfunc_build_corrected_;
     DISTFUNC<float> fstdistfunc_search_;
 
 public:
@@ -227,7 +226,6 @@ public:
             fstdistfunc_build_ = distBuildScalarB4;
             fstdistfunc_search_ = distSearchScalarB4;
 #endif
-            fstdistfunc_build_corrected_ = distBuildCorrectedScalarB4;
         } else {
 #if defined(USE_AVX)
             fstdistfunc_ = distBuildAVX;
@@ -246,7 +244,6 @@ public:
             fstdistfunc_build_ = distBuildScalar;
             fstdistfunc_search_ = distSearchScalar;
 #endif
-            fstdistfunc_build_corrected_ = distBuildCorrectedScalar;
         }
 
         lm_table_ = computeLloydMax(bits_per_coord - 1);
@@ -264,9 +261,6 @@ public:
 
     // Search distance function (asymmetric: PreparedQuery × code)
     DISTFUNC<float> get_search_dist_func() const { return fstdistfunc_search_; }
-
-    // Build corrected distance function (code × code with QJL cross-term)
-    DISTFUNC<float> getBuildCorrectedFunc() const { return fstdistfunc_build_corrected_; }
 
     // Accessors
     size_t dim() const { return dim_; }
@@ -382,12 +376,6 @@ public:
     /// Switch HNSW to build mode: symmetric distance (code × code).
     void setBuildMode(HierarchicalNSW<float> &hnsw) {
         hnsw.fstdistfunc_ = fstdistfunc_build_;
-        hnsw.dist_func_param_ = this;
-    }
-
-    /// Switch HNSW to corrected build mode: code × code with QJL cross-term.
-    void setCorrectedBuildMode(HierarchicalNSW<float> &hnsw) {
-        hnsw.fstdistfunc_ = fstdistfunc_build_corrected_;
         hnsw.dist_func_param_ = this;
     }
 
@@ -1806,17 +1794,10 @@ public:
   // -- Build ----------------------------------------------------------------
 
   /// Initialize space and HNSW graph for building. Call addPoint() to populate.
-  /// If use_corrected_build is true, uses distBuildCorrected (with QJL cross-term).
-  void initBuild(size_t max_elements, size_t M = 16,
-                 size_t ef_construction = 200,
-                 bool use_corrected_build = false) {
-    space_.reset(
-        new TurboQuantSpace(dim_, bits_per_coord_, rot_seed_, qjl_seed_));
-    hnsw_.reset(new HierarchicalNSW<float>(space_.get(), max_elements, M,
-                                           ef_construction));
-    if (use_corrected_build) {
-      space_->setCorrectedBuildMode(*hnsw_);
-    }
+  void initBuild(size_t max_elements, size_t M = 16, size_t ef_construction = 200)
+  {
+      space_.reset(new TurboQuantSpace(dim_, bits_per_coord_, rot_seed_, qjl_seed_));
+      hnsw_.reset(new HierarchicalNSW<float>(space_.get(), max_elements, M, ef_construction));
   }
 
   /// Encode a float vector and add it to the index. Thread-safe (addPoint uses
@@ -1829,26 +1810,24 @@ public:
 
   /// Build a TQ-compressed HNSW index from raw float vectors (single-threaded).
   /// data[i] points to a float[dim] vector for label i.
-  Status build(const float *const *data, size_t n, size_t M = 16,
-               size_t ef_construction = 200,
-               bool use_corrected_build = false) {
-    initBuild(n, M, ef_construction, use_corrected_build);
+  Status build(const float *const *data, size_t n, size_t M = 16, size_t ef_construction = 200)
+  {
+      initBuild(n, M, ef_construction);
 
-    std::vector<char> buf(space_->codeSizeBytes());
-    for (size_t i = 0; i < n; ++i)
-      addPoint(data[i], i, buf.data());
+      std::vector<char> buf(space_->codeSizeBytes());
+      for (size_t i = 0; i < n; ++i)
+          addPoint(data[i], i, buf.data());
 
-    return OkStatus();
+      return OkStatus();
   }
 
   /// Build from contiguous array: data points to n*dim floats, row-major.
-  Status build(const float *data, size_t n, size_t M = 16,
-               size_t ef_construction = 200,
-               bool use_corrected_build = false) {
-    std::vector<const float *> ptrs(n);
-    for (size_t i = 0; i < n; ++i)
-      ptrs[i] = data + i * dim_;
-    return build(ptrs.data(), n, M, ef_construction, use_corrected_build);
+  Status build(const float *data, size_t n, size_t M = 16, size_t ef_construction = 200)
+  {
+      std::vector<const float *> ptrs(n);
+      for (size_t i = 0; i < n; ++i)
+          ptrs[i] = data + i * dim_;
+      return build(ptrs.data(), n, M, ef_construction);
   }
 
   // -- L2-graph build path (low-level, for parallel insertion) --------------

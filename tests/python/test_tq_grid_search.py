@@ -20,8 +20,8 @@ import os
 import struct
 import time
 
-import numpy as np
 import hnswlib
+import numpy as np
 
 # ---------------------------------------------------------------------------
 # Parameter grid — edit this to control the sweep
@@ -30,18 +30,18 @@ import hnswlib
 # Build configurations: (bits, M, ef_construction)
 BUILD_GRID = [
     # bits  M   ef_c
-    (4,     16,  100),
-    (4,     16,  200),
-    (4,     16,  400),
-    (4,     32,  400),
-    (4,     32,  800),
-    (4,     48,  600),
-    (8,     16,  100),
-    (8,     16,  200),
-    (8,     16,  400),
-    (8,     32,  400),
-    (8,     32,  800),
-    (8,     48,  600),
+    (4, 16, 100),
+    (4, 16, 200),
+    (4, 16, 400),
+    (4, 32, 400),
+    (4, 32, 800),
+    (4, 48, 600),
+    (8, 16, 100),
+    (8, 16, 200),
+    (8, 16, 400),
+    (8, 32, 400),
+    (8, 32, 800),
+    (8, 48, 600),
 ]
 
 # Search ef values to sweep for each build config
@@ -50,10 +50,10 @@ SEARCH_EFS = [64, 128, 256, 512, 1024]
 # L2 baseline build params
 L2_BUILDS = [
     # M   ef_c
-    (16,  100),
-    (16,  200),
-    (32,  200),
-    (32,  400),
+    (16, 100),
+    (16, 200),
+    (32, 200),
+    (32, 400),
 ]
 
 # L2 baseline search ef
@@ -62,14 +62,14 @@ L2_SEARCH_EFS = [64, 128, 256, 512]
 # Rerank configurations: (bits, M, ef_c, search_ef, rerank_ef)
 RERANK_GRID = [
     # bits  M   ef_c   ef   rr_ef
-    (4,     16,  200,   64,  128),
-    (4,     16,  200,  128,  256),
-    (4,     16,  200,  256,  512),
-    (4,     16,  200,  512, 1024),
-    (8,     16,  200,   64,  128),
-    (8,     16,  200,  128,  256),
-    (8,     16,  200,  256,  512),
-    (8,     16,  200,  512, 1024),
+    (4, 16, 200, 64, 128),
+    (4, 16, 200, 128, 256),
+    (4, 16, 200, 256, 512),
+    (4, 16, 200, 512, 1024),
+    (8, 16, 200, 64, 128),
+    (8, 16, 200, 128, 256),
+    (8, 16, 200, 256, 512),
+    (8, 16, 200, 512, 1024),
 ]
 
 # Use corrected build distance (QJL cross-term) — set to True to include
@@ -264,7 +264,7 @@ def measure_search(idx, queries, k, ef, num_threads):
     dt = time.time() - t0
 
     qps = len(queries) / dt
-    latency_ms = (dt / len(queries)) * 1000  # Среднее время на один запрос
+    latency_ms = (dt / len(queries)) * 1000  # Average latency per query in ms
     return labels, qps, latency_ms
 
 
@@ -274,7 +274,7 @@ def measure_rerank(idx, queries, k, ef, rerank_ef, num_threads):
     idx.ef = ef
     t0 = time.time()
     labels, _ = idx.knn_query_rerank(queries, k=actual_k, rerank_ef=rerank_ef,
-                                      num_threads=num_threads)
+                                     num_threads=num_threads)
     dt = time.time() - t0
     qps = len(queries) / dt
     return labels, qps, actual_k
@@ -307,7 +307,8 @@ def run_grid_search(data, queries, gt_labels, dim, dataset_name, results):
                        qps=qps, build_s=build_s,
                        mem_per_vec=dim * 4)
             results.append(row)
-            print(f"    ef={ef:>5}  R@1={fmt_recall(r1)}  R@10={fmt_recall(r10)}  R@100={fmt_recall(r100)}  QPS={qps:>8.0f}")
+            print(
+                f"    ef={ef:>5}  R@1={fmt_recall(r1)}  R@10={fmt_recall(r10)}  R@100={fmt_recall(r100)}  QPS={qps:>8.0f}")
         del idx
 
     # ---- TQ builds (no rerank) ----
@@ -337,7 +338,8 @@ def run_grid_search(data, queries, gt_labels, dim, dataset_name, results):
                            ef=ef, rerank_ef=0, recall_1=r1, recall_10=r10, recall_100=r100,
                            qps=qps, build_s=build_s, mem_per_vec=code_sz)
                 results.append(row)
-                print(f"    ef={ef:>5}  R@1={fmt_recall(r1)}  R@10={fmt_recall(r10)}  R@100={fmt_recall(r100)}  QPS={qps:>8.0f}")
+                print(
+                    f"    ef={ef:>5}  R@1={fmt_recall(r1)}  R@10={fmt_recall(r10)}  R@100={fmt_recall(r100)}  QPS={qps:>8.0f}")
             del idx
 
     # ---- L2-graph + TQ search (no rerank) ----
@@ -367,7 +369,8 @@ def run_grid_search(data, queries, gt_labels, dim, dataset_name, results):
                        ef=ef, rerank_ef=0, recall_1=r1, recall_10=r10, recall_100=r100,
                        qps=qps, build_s=build_s, mem_per_vec=code_sz)
             results.append(row)
-            print(f"    tq{bits} ef={ef:>5}  R@1={fmt_recall(r1)}  R@10={fmt_recall(r10)}  R@100={fmt_recall(r100)}  QPS={qps:>8.0f}")
+            print(
+                f"    tq{bits} ef={ef:>5}  R@1={fmt_recall(r1)}  R@10={fmt_recall(r10)}  R@100={fmt_recall(r100)}  QPS={qps:>8.0f}")
 
         # Rerank
         for ef_rr, rr_ef in rerank_by_bits.get(bits, []):
@@ -379,7 +382,8 @@ def run_grid_search(data, queries, gt_labels, dim, dataset_name, results):
                        qps=qps, build_s=build_s,
                        mem_per_vec=code_sz + dim * 4)
             results.append(row)
-            print(f"    rr{bits} ef={ef_rr:>4} rr={rr_ef:>4}  R@1={fmt_recall(r1)}  R@10={fmt_recall(r10)}  R@100={fmt_recall(r100)}  QPS={qps:>8.0f}")
+            print(
+                f"    rr{bits} ef={ef_rr:>4} rr={rr_ef:>4}  R@1={fmt_recall(r1)}  R@10={fmt_recall(r10)}  R@100={fmt_recall(r100)}  QPS={qps:>8.0f}")
 
         del idx
 
@@ -389,9 +393,9 @@ def run_grid_search(data, queries, gt_labels, dim, dataset_name, results):
 # ---------------------------------------------------------------------------
 
 def print_summary(results):
-    print(f"\n{'='*125}")
+    print(f"\n{'=' * 125}")
     print("SUMMARY — sorted by dataset, then recall@10 descending")
-    print(f"{'='*125}")
+    print(f"{'=' * 125}")
     hdr = (f"{'Dataset':<18} {'Method':<12} {'bits':>4} {'M':>3} {'efc':>5} "
            f"{'ef':>5} {'rr_ef':>5} {'R@1':>7} {'R@10':>7} {'R@100':>7} {'QPS':>9} "
            f"{'build':>7} {'B/vec':>6}")
@@ -399,8 +403,8 @@ def print_summary(results):
     print("-" * 125)
 
     from itertools import groupby
-    sorted_results = sorted(results, key=lambda r: (r["dataset"], -(r["recall_10"] or 0)))
-    for ds, group in groupby(sorted_results, key=lambda r: r["dataset"]):
+    sorted_results = sorted(results, key=lambda r_: (r_["dataset"], -(r_["recall_10"] or 0)))
+    for ds, group in groupby(sorted_results, key=lambda r_: r_["dataset"]):
         for r in group:
             print(f"{r['dataset']:<18} {r['method']:<12} {r['bits']:>4} {r['M']:>3} "
                   f"{r['ef_c']:>5} {r['ef']:>5} {r['rerank_ef']:>5} "
@@ -411,9 +415,9 @@ def print_summary(results):
 
 def print_best_per_dataset(results):
     """Print best non-rerank config per dataset."""
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print("BEST non-rerank configs (highest R@10 with QPS > 5000)")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
 
     from itertools import groupby
     sorted_results = sorted(results, key=lambda r: r["dataset"])
@@ -447,7 +451,7 @@ def analyze_efficiency(results):
     print("EFFICIENCY ANALYSIS (Target Recall vs Latency)")
     print(f"{'=' * 80}")
 
-    # Группируем по датасету
+    # Group by dataset
     from collections import defaultdict
     ds_groups = defaultdict(list)
     for r in results:
@@ -458,19 +462,145 @@ def analyze_efficiency(results):
         print(f"{'Target R@10':<12} | {'Method':<12} | {'Latency (ms)':<12} | {'QPS':<10} | {'Bits':<5}")
         print("-" * 65)
 
-        # Целевые уровни полноты
+        # Target recall levels
         for target in [0.5, 0.8, 0.9, 0.95, 0.99]:
-            # Фильтруем конфиги, которые достигли цели
+            # Filter configs that reached the target
             candidates = [r for r in data if (r['recall_10'] or 0) >= target]
 
             if candidates:
-                # Находим самый быстрый (максимальный QPS)
+                # Find the fastest (highest QPS)
                 best = max(candidates, key=lambda x: x['qps'])
-                latency = 1000 / best['qps']  # Время на 1 запрос в мс
+                latency = 1000 / best['qps']  # Latency per query in ms
                 print(
                     f"{target:<12} | {best['method']:<12} | {latency:<12.3f} | {best['qps']:<10.0f} | {best['bits']:<5}")
             else:
                 print(f"{target:<12} | {'N/A':<12} | {'-':<12} | {'-':<10} | {'-'}")
+
+
+
+
+
+
+
+
+def plot_turboquant_comparison(csv_path: str = "tq_grid_search_results.csv", save_prefix: str = "tq_final"):
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    import plotly.express as px
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    sns.set_theme(style="whitegrid", font_scale=1.1)
+    plt.rcParams['figure.figsize'] = (18, 12)
+
+    """
+    Professional TurboQuant results visualization with full method comparison.
+    """
+    df = pd.read_csv(csv_path)
+    df['bits'] = df['bits'].astype(int)
+
+    # Map method names to human-readable labels
+    method_map = {
+        'l2': 'L2 Baseline',
+        'tq': 'TurboQuant',
+        'l2g_tq': 'L2-graph + TQ',
+        'l2g_rerank': 'L2-graph + Rerank'
+    }
+    df['method'] = df['method'].map(method_map)
+
+    # ====================== 1. Pareto Front (main plot) ======================
+    plt.figure(figsize=(14, 9))
+
+    # Quantized methods only
+    quant_df = df[df['method'].isin(['TurboQuant', 'L2-graph + TQ', 'L2-graph + Rerank'])].copy()
+
+    sns.scatterplot(
+        data=quant_df,
+        x='qps',
+        y='recall_10',
+        hue='bits',
+        style='method',
+        size='M',
+        palette='viridis',
+        sizes=(80, 450),
+        alpha=0.9,
+        edgecolor='black',
+        linewidth=0.8
+    )
+
+    # L2 Baseline as a horizontal reference line
+    l2_max = df[df['method'] == 'L2 Baseline']['recall_10'].max()
+    plt.axhline(y=l2_max, color='red', linestyle='--', linewidth=2.5,
+                label=f'L2 Baseline (max recall@10 = {l2_max:.4f})')
+
+    plt.title('Pareto Front: Recall@10 vs Speed (TurboQuant vs L2)', fontsize=16, pad=20)
+    plt.xlabel('Queries Per Second (log scale)')
+    plt.ylabel('Recall@10')
+    plt.xscale('log')
+    plt.legend(title='Configuration', bbox_to_anchor=(1.02, 1), loc='upper left')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f"{save_prefix}_pareto.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
+    # ====================== 2. Full dashboard (4 panels) ======================
+    fig = plt.figure(figsize=(20, 14))
+    gs = fig.add_gridspec(2, 3, height_ratios=[1, 1])
+
+    # A. Recall@10 vs efSearch (line plot)
+    ax1 = fig.add_subplot(gs[0, 0])
+    sns.lineplot(data=quant_df, x='ef', y='recall_10', hue='bits', style='M',
+                 markers=True, linewidth=2.5, markersize=8, ax=ax1)
+    ax1.set_title('Recall@10 vs efSearch')
+    ax1.set_xlabel('efSearch')
+    ax1.set_ylabel('Recall@10')
+
+    # B. Recall vs QPS (scatter)
+    ax2 = fig.add_subplot(gs[0, 1])
+    sns.scatterplot(data=quant_df, x='qps', y='recall_10',
+                    hue='bits', style='method', size='M',
+                    palette='viridis', sizes=(60, 400), alpha=0.85, ax=ax2)
+    ax2.set_xscale('log')
+    ax2.set_title('Recall@10 vs Speed')
+    ax2.set_xlabel('QPS (log)')
+    ax2.set_ylabel('Recall@10')
+
+    # C. TurboQuant heatmap
+    ax3 = fig.add_subplot(gs[0, 2])
+    tq_pivot = df[df['method'] == 'TurboQuant'].pivot_table(
+        values='recall_10', index='M', columns='ef', aggfunc='max')
+    sns.heatmap(tq_pivot, annot=True, fmt='.3f', cmap='viridis',
+                cbar_kws={'label': 'Recall@10'}, ax=ax3)
+    ax3.set_title('Recall@10 Heatmap (TurboQuant)')
+
+    # D. All methods comparison
+    ax4 = fig.add_subplot(gs[1, :])
+    sns.barplot(data=df, x='bits', y='recall_10', hue='method', palette='Set2', ax=ax4)
+    ax4.axhline(y=l2_max, color='red', linestyle='--', linewidth=2.5, label='L2 Baseline')
+    ax4.set_title('Recall@10 by Method and Bits')
+    ax4.set_ylabel('Recall@10')
+    ax4.legend(title='Method')
+
+    plt.suptitle('TurboQuant Grid Search — Full Comparison Dashboard', fontsize=18, y=1.02)
+    plt.tight_layout()
+    plt.savefig(f"{save_prefix}_dashboard.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
+    # ====================== 3. Top-15 best configurations ======================
+    top = df.nlargest(15, 'recall_10')
+    print("\n🔥 TOP-15 best configurations by Recall@10:")
+    print(top[['dataset', 'method', 'bits', 'M', 'ef', 'recall_10', 'qps', 'mem_per_vec']]
+          .round(4).to_string(index=False))
+
+    print(f"\n✅ Plots saved:\n   • {save_prefix}_pareto.png\n   • {save_prefix}_dashboard.png")
+
+
+
+
+
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -515,9 +645,9 @@ def main():
             print(f"Unknown dataset: {ds_name}")
             continue
 
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print(f"Dataset: {ds_name}")
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
 
         loaded = load_dataset(ds_name, args.base_dir, max_elements=args.max_elements)
         if loaded is None:
@@ -532,7 +662,7 @@ def main():
             print(f"  Recomputing GT (brute force, K={K})...")
             t0 = time.time()
             gt_labels = compute_bruteforce_gt(data, queries, K, NUM_THREADS)
-            print(f"    done in {time.time()-t0:.1f}s")
+            print(f"    done in {time.time() - t0:.1f}s")
 
         run_grid_search(data, queries, gt_labels, dim, ds_name, results)
 
@@ -540,17 +670,21 @@ def main():
     if results:
         csv_path = os.path.join(args.base_dir, args.output)
         fields = ["dataset", "method", "bits", "M", "ef_c", "ef", "rerank_ef",
-                   "recall_1", "recall_10", "recall_100", "qps", "build_s", "mem_per_vec"]
+                  "recall_1", "recall_10", "recall_100", "qps", "build_s", "mem_per_vec"]
         with open(csv_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
             writer.writerows(results)
         print(f"\nResults saved to {csv_path}")
 
-    analyze_efficiency(results)
+        analyze_efficiency(results)
 
-    print_summary(results)
-    print_best_per_dataset(results)
+        print_summary(results)
+        print_best_per_dataset(results)
+
+        plot_turboquant_comparison(args.output)
+    else:
+        assert True
 
 
 if __name__ == "__main__":
